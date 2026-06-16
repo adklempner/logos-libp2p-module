@@ -2,20 +2,44 @@
   "nodes": {
     "libp2p": {
       "inputs": {
+        "libp2p_mix": "libp2p_mix",
         "nixpkgs": "nixpkgs"
       },
       "locked": {
-        "lastModified": 1778508233,
-        "narHash": "sha256-lSD+ypRXbt/Dy6puLrvU74PXhQ1cdXfXMznU8laRGok=",
-        "owner": "vacp2p",
-        "repo": "nim-libp2p",
-        "rev": "3f5a4dce286674aefd01a1ca21538ee7252efbc0",
-        "type": "github"
+        "lastModified": 1781375688,
+        "narHash": "sha256-GPtNwNWy9WAF7FgaCAM+bQkAnHWDXynRN94Wc6fP64k=",
+        "ref": "feat/cbind-rln",
+        "rev": "3f376c54902c1f2acae67143fdc2ce1d9d48d4ca",
+        "revCount": 26,
+        "type": "git",
+        "url": "file:///Users/arseniy/Waku/Logos/mix-rln-spam-protection-plugin"
       },
       "original": {
-        "owner": "vacp2p",
-        "repo": "nim-libp2p",
-        "type": "github"
+        "ref": "feat/cbind-rln",
+        "type": "git",
+        "url": "file:///Users/arseniy/Waku/Logos/mix-rln-spam-protection-plugin"
+      }
+    },
+    "libp2p_mix": {
+      "inputs": {
+        "nixpkgs": [
+          "libp2p",
+          "nixpkgs"
+        ]
+      },
+      "locked": {
+        "lastModified": 1781365882,
+        "narHash": "sha256-hY8yJ42iZrgREzR7EDKcvUFEOpXD5Qog7Jk59b8tzQs=",
+        "ref": "feat/mix-cbind",
+        "rev": "594c33ebdbff7bb659db8b48dbf0064a471704ec",
+        "revCount": 99,
+        "type": "git",
+        "url": "file:///Users/arseniy/Waku/Logos/nim-libp2p-mix"
+      },
+      "original": {
+        "ref": "feat/mix-cbind",
+        "type": "git",
+        "url": "file:///Users/arseniy/Waku/Logos/nim-libp2p-mix"
       }
     },
     "logos-capability-module": {

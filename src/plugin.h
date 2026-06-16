@@ -16,10 +16,19 @@
 
 #include "logos_json.h"
 #include "logos_result.h"
+#include <logos_module_context.h>
 
 extern "C" {
 #include "lib/libp2p.h"
+#include "lib/libp2p_mix_rln.h"
 }
+
+// LogosAPI is the cross-module client factory; forward-declared so this
+// codegen-scanned header stays free of Qt/SDK includes (rln.cpp pulls them).
+class LogosAPI;
+// QTimer is forward-declared for the same reason; the in-module proof-refresh
+// timer is created/used only in rln.cpp, which includes the Qt headers.
+class QTimer;
 
 struct Libp2pModuleOptions {
     std::vector<std::string> addrs = {};
@@ -68,7 +77,7 @@ inline StdLogosResult parseJsonResponse(const std::string& s, const char* errPre
     return {true, j, ""};
 }
 
-class Libp2pModuleImpl {
+class Libp2pModuleImpl : public LogosModuleContext {
 public:
     Libp2pModuleImpl(const Libp2pModuleOptions& options = {});
     ~Libp2pModuleImpl();
@@ -119,28 +128,59 @@ public:
     StdLogosResult kadGetProviders(const std::string& cid);
     StdLogosResult kadGetRandomRecords();
 
-#if 0  // mix temporarily disabled — extracted to separate repo, no cbindings yet
-
     StdLogosResult mixGeneratePrivKey();
     StdLogosResult mixPublicKey(const std::string& privKey);
-    StdLogosResult mixDial(const std::string& peerId,
-                           const std::string& multiaddr,
-                           const std::string& proto);
-    StdLogosResult mixDialWithReply(const std::string& peerId,
-                                    const std::string& multiaddr,
-                                    const std::string& proto,
-                                    int expectReply,
-                                    uint8_t numSurbs);
-    StdLogosResult mixRegisterDestReadBehavior(const std::string& proto,
-                                               int behavior,
-                                               uint32_t sizeParam);
-    StdLogosResult mixSetNodeInfo(const std::string& multiaddr,
-                                  const std::string& mixPrivKey);
-    StdLogosResult mixNodepoolAdd(const std::string& peerId,
-                                  const std::string& multiaddr,
-                                  const std::string& mixPubKey,
-                                  const std::string& libp2pPubKey);
-#endif
+    // Mix dial methods take a single JSON-blob arg to survive the
+    // universal-codegen QtRO dispatch (which drops multi-string / int / uint
+    // signatures), same as mixSetNodeInfo. Keys per method:
+    //   mixDial:                 {peerId, multiaddr, proto}
+    //   mixDialWithReply:        {peerId, multiaddr, proto, expectReply, numSurbs}
+    //   mixRegisterDestReadBehavior: {proto, behavior, sizeParam}
+    //   mixNodepoolAdd:          {peerId, multiaddr, mixPubKey, libp2pPubKey}
+    //                            (mixPubKey/libp2pPubKey are hex-encoded keys)
+    StdLogosResult mixDial(const std::string& argsJson);
+    StdLogosResult mixDialWithReply(const std::string& argsJson);
+    StdLogosResult mixRegisterDestReadBehavior(const std::string& argsJson);
+    // Mounts the mix protocol with this node's routing identity (and triggers
+    // the RLN SpamProtection factory → group-manager creation). Args are a
+    // single JSON object to survive the universal-codegen QtRO dispatch (which
+    // drops multi-string signatures): {"multiaddr": <str>, "mixPrivKeyHex":
+    // <64-hex-char curve25519 priv key>}.
+    StdLogosResult mixSetNodeInfo(const std::string& argsJson);
+    StdLogosResult mixNodepoolAdd(const std::string& argsJson);
+
+    /* ----------- RLN spam protection (LEZ-backed) ----------- */
+
+    // Wires the LogosAPI handle used to route the RLN fetcher into the rln
+    // module. Encoded as a hex string because the universal codegen doesn't
+    // recognise opaque pointer types directly (host passes
+    // QString::number(reinterpret_cast<quintptr>(api), 16)).
+    bool initLogos(const std::string& apiHandleHex);
+
+    // Enable RLN spam protection on the mix protocol. configJson keys: see
+    // libp2p_mix_rln.h. MUST be called before start() (the SpamProtection
+    // factory is read when mix mounts). Installs the rln-module fetcher.
+    StdLogosResult rlnEnable(const std::string& configJson);
+    // Set the RLN credential (idSecretHash hex, 64 chars) + on-chain leaf.
+    StdLogosResult rlnSetIdentity(const std::string& idSecretHashHex,
+                                  int64_t leafIndex);
+    StdLogosResult rlnIsReady();
+    StdLogosResult rlnStartPolling();
+    // Self-registration (v1, no gifter): register this node's membership via
+    // the rln module, poll until confirmed, then set identity with the leaf.
+    // Args are passed as a single JSON object so the call survives the
+    // universal-codegen QtRO dispatch (which only marshals single-string /
+    // (string,int) signatures cleanly — multi-string / int64 args are dropped).
+    // JSON keys: {"config": <configAccount>, "wallet": <holdingAccount>,
+    //             "rate": <int>}.
+    StdLogosResult rlnRegister(const std::string& argsJson);
+    // Fetch this node's merkle proof from the rln module (on the Qt/RPC thread,
+    // where cross-module calls are safe) and push it into the mix RLN group
+    // manager's cache. Call repeatedly after rlnRegister until rlnIsReady() is
+    // true — the membership takes a few blocks to land in the on-chain tree.
+    // This replaces the GM's internal poll loop, whose fetch ran on the libp2p
+    // thread and deadlocked against the QtRO owner-thread marshaling.
+    StdLogosResult rlnRefreshProof();
 
     StdLogosResult discoStart();
     StdLogosResult discoStop();
@@ -235,6 +275,33 @@ private:
     static void eventCallback(int ret, const char* msg, size_t len, void* userData);
 
     void emitEventSafe(const std::string& name, const std::string& data) const;
+
+    // RLN: LogosAPI handle (set via initLogos) used to route the mix RLN
+    // fetcher into the rln module, and the LEZ config-account the fetcher
+    // queries. The fetcher trampoline runs on the libp2p thread and calls
+    // synchronously into the rln module (acceptable v1 — not the Qt thread).
+    LogosAPI* m_logosAPI = nullptr;
+    std::string m_rlnConfigAccount;
+    // This node's on-chain RLN membership leaf (set by rlnRegister), used by
+    // rlnRefreshProof to fetch the matching merkle proof.
+    int64_t m_rlnLeafIndex = -1;
+    // Keep-fresh cadence (seconds) for the proof-refresh timer once ready;
+    // captured from rlnEnable's epochDurationSeconds. The pre-ready phase polls
+    // faster (see startRlnRefreshTimer).
+    double m_rlnEpochSeconds = 10.0;
+    // Self-scheduling timer on the module's Qt thread (where cross-module calls
+    // are safe) that drives rlnRefreshProof after registration, so the module
+    // reaches and maintains readiness without a host-side refresh loop.
+    QTimer* m_rlnRefreshTimer = nullptr;
+    void startRlnRefreshTimer();
+    void stopRlnRefreshTimer();
+    // Resolves the LogosAPI: prefers the explicit initLogos(hex) handle, else
+    // lazily takes it from the LogosModuleContext mixin (modules().api), which
+    // the framework populates in daemon mode. Returns null if neither is set.
+    LogosAPI* ensureLogosAPI();
+    static int rlnFetcherTrampoline(const char* methodName, const char* params,
+                                    Libp2pMixRlnFetchCallback callback,
+                                    void* callbackData, void* fetcherData);
 
     // Wraps the new-promise / invoke / await / clean-up dance shared by every
     // sync-over-async libp2p op. `invoke(SyncPromise*)` calls the cbinding and

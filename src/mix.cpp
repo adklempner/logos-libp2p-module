@@ -2,6 +2,31 @@
 
 #include <cstring>
 
+namespace {
+
+// Decode a hex string (optional 0x prefix) into exactly outLen bytes. Used for
+// the JSON-blob mix dial args, where binary keys travel as hex.
+bool hexDecode(const std::string& hex, void* out, size_t outLen) {
+    std::string h = hex;
+    if (h.rfind("0x", 0) == 0 || h.rfind("0X", 0) == 0) h = h.substr(2);
+    if (h.size() != outLen * 2) return false;
+    auto nib = [](char c) -> int {
+        if (c >= '0' && c <= '9') return c - '0';
+        if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+        if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+        return -1;
+    };
+    auto* o = static_cast<uint8_t*>(out);
+    for (size_t i = 0; i < outLen; ++i) {
+        int hi = nib(h[i * 2]), lo = nib(h[i * 2 + 1]);
+        if (hi < 0 || lo < 0) return false;
+        o[i] = static_cast<uint8_t>((hi << 4) | lo);
+    }
+    return true;
+}
+
+}  // namespace
+
 StdLogosResult Libp2pModuleImpl::mixGeneratePrivKey() {
     if (!ctx) return {false, {}, "No libp2p context"};
 
@@ -27,12 +52,19 @@ StdLogosResult Libp2pModuleImpl::mixPublicKey(const std::string& privKey) {
     return {true, std::string(reinterpret_cast<const char*>(&outKey), sizeof(outKey)), ""};
 }
 
-StdLogosResult Libp2pModuleImpl::mixDial(
-    const std::string& peerId,
-    const std::string& multiaddr,
-    const std::string& proto)
+StdLogosResult Libp2pModuleImpl::mixDial(const std::string& argsJson)
 {
     if (!ctx) return {false, {}, "No libp2p context"};
+
+    std::string peerId, multiaddr, proto;
+    try {
+        auto a = nlohmann::json::parse(argsJson);
+        peerId = a.at("peerId").get<std::string>();
+        multiaddr = a.at("multiaddr").get<std::string>();
+        proto = a.at("proto").get<std::string>();
+    } catch (...) {
+        return {false, {}, "mixDial: bad args json (need {peerId,multiaddr,proto})"};
+    }
 
     auto* p = new SyncPromise();
     auto f = p->get_future();
@@ -51,19 +83,30 @@ StdLogosResult Libp2pModuleImpl::mixDial(
     return {true, 0, ""};
 }
 
-StdLogosResult Libp2pModuleImpl::mixDialWithReply(
-    const std::string& peerId,
-    const std::string& multiaddr,
-    const std::string& proto,
-    int expectReply,
-    uint8_t numSurbs)
+StdLogosResult Libp2pModuleImpl::mixDialWithReply(const std::string& argsJson)
 {
     if (!ctx) return {false, {}, "No libp2p context"};
+
+    std::string peerId, multiaddr, proto;
+    int expectReply = 0;
+    int numSurbs = 0;
+    try {
+        auto a = nlohmann::json::parse(argsJson);
+        peerId = a.at("peerId").get<std::string>();
+        multiaddr = a.at("multiaddr").get<std::string>();
+        proto = a.at("proto").get<std::string>();
+        expectReply = a.value("expectReply", 0);
+        numSurbs = a.value("numSurbs", 0);
+    } catch (...) {
+        return {false, {},
+                "mixDialWithReply: bad args json (need {peerId,multiaddr,proto,expectReply,numSurbs})"};
+    }
 
     auto* p = new SyncPromise();
     auto f = p->get_future();
     int ret = libp2p_mix_dial_with_reply(ctx, peerId.c_str(), multiaddr.c_str(),
-                                         proto.c_str(), expectReply, numSurbs,
+                                         proto.c_str(), expectReply,
+                                         static_cast<uint8_t>(numSurbs),
                                          &Libp2pModuleImpl::promiseConnectionCallback, p);
     if (ret != RET_OK) { delete p; return {false, {}, "Failed to mix dial with reply"}; }
 
@@ -78,12 +121,22 @@ StdLogosResult Libp2pModuleImpl::mixDialWithReply(
     return {true, 0, ""};
 }
 
-StdLogosResult Libp2pModuleImpl::mixRegisterDestReadBehavior(
-    const std::string& proto,
-    int behavior,
-    uint32_t sizeParam)
+StdLogosResult Libp2pModuleImpl::mixRegisterDestReadBehavior(const std::string& argsJson)
 {
     if (!ctx) return {false, {}, "No libp2p context"};
+
+    std::string proto;
+    int behavior = 0;
+    uint32_t sizeParam = 0;
+    try {
+        auto a = nlohmann::json::parse(argsJson);
+        proto = a.at("proto").get<std::string>();
+        behavior = a.at("behavior").get<int>();
+        sizeParam = a.value("sizeParam", 0u);
+    } catch (...) {
+        return {false, {},
+                "mixRegisterDestReadBehavior: bad args json (need {proto,behavior,sizeParam})"};
+    }
 
     auto* p = new SyncPromise();
     auto f = p->get_future();
@@ -98,18 +151,34 @@ StdLogosResult Libp2pModuleImpl::mixRegisterDestReadBehavior(
     return {true, {}, ""};
 }
 
-StdLogosResult Libp2pModuleImpl::mixSetNodeInfo(
-    const std::string& multiaddr,
-    const std::string& mixPrivKey)
+StdLogosResult Libp2pModuleImpl::mixSetNodeInfo(const std::string& argsJson)
 {
     if (!ctx) return {false, {}, "No libp2p context"};
 
-    if (mixPrivKey.size() != sizeof(libp2p_curve25519_key_t)) {
-        return {false, {}, "Invalid key size"};
+    std::string multiaddr, keyHex;
+    try {
+        auto a = nlohmann::json::parse(argsJson);
+        multiaddr = a.at("multiaddr").get<std::string>();
+        keyHex = a.at("mixPrivKeyHex").get<std::string>();
+    } catch (...) {
+        return {false, {}, "mixSetNodeInfo: bad args json (need {multiaddr,mixPrivKeyHex})"};
     }
 
     libp2p_curve25519_key_t key{};
-    memcpy(&key, mixPrivKey.data(), sizeof(key));
+    if (keyHex.size() != sizeof(key) * 2) {
+        return {false, {}, "mixPrivKeyHex must be 64 hex chars"};
+    }
+    auto nib = [](char c) -> int {
+        if (c >= '0' && c <= '9') return c - '0';
+        if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+        if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+        return -1;
+    };
+    for (size_t i = 0; i < sizeof(key); ++i) {
+        int hi = nib(keyHex[i * 2]), lo = nib(keyHex[i * 2 + 1]);
+        if (hi < 0 || lo < 0) return {false, {}, "mixPrivKeyHex not valid hex"};
+        reinterpret_cast<uint8_t*>(&key)[i] = static_cast<uint8_t>((hi << 4) | lo);
+    }
 
     auto* p = new SyncPromise();
     auto f = p->get_future();
@@ -122,23 +191,30 @@ StdLogosResult Libp2pModuleImpl::mixSetNodeInfo(
     return {true, {}, ""};
 }
 
-StdLogosResult Libp2pModuleImpl::mixNodepoolAdd(
-    const std::string& peerId,
-    const std::string& multiaddr,
-    const std::string& mixPubKey,
-    const std::string& libp2pPubKey)
+StdLogosResult Libp2pModuleImpl::mixNodepoolAdd(const std::string& argsJson)
 {
     if (!ctx) return {false, {}, "No libp2p context"};
 
-    if (mixPubKey.size() != sizeof(libp2p_curve25519_key_t) ||
-        libp2pPubKey.size() != sizeof(libp2p_secp256k1_pubkey_t)) {
-        return {false, {}, "Invalid key sizes"};
+    std::string peerId, multiaddr, mixPubKeyHex, libp2pPubKeyHex;
+    try {
+        auto a = nlohmann::json::parse(argsJson);
+        peerId = a.at("peerId").get<std::string>();
+        multiaddr = a.at("multiaddr").get<std::string>();
+        mixPubKeyHex = a.at("mixPubKey").get<std::string>();
+        libp2pPubKeyHex = a.at("libp2pPubKey").get<std::string>();
+    } catch (...) {
+        return {false, {},
+                "mixNodepoolAdd: bad args json (need {peerId,multiaddr,mixPubKey,libp2pPubKey} hex keys)"};
     }
 
     libp2p_curve25519_key_t mixKey{};
     libp2p_secp256k1_pubkey_t lpKey{};
-    memcpy(&mixKey, mixPubKey.data(), sizeof(mixKey));
-    memcpy(&lpKey, libp2pPubKey.data(), sizeof(lpKey));
+    if (!hexDecode(mixPubKeyHex, &mixKey, sizeof(mixKey))) {
+        return {false, {}, "mixPubKey must be hex for a curve25519 key"};
+    }
+    if (!hexDecode(libp2pPubKeyHex, &lpKey, sizeof(lpKey))) {
+        return {false, {}, "libp2pPubKey must be hex for a secp256k1 pubkey"};
+    }
 
     auto* p = new SyncPromise();
     auto f = p->get_future();

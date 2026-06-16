@@ -1,0 +1,11 @@
+module liblogos_rln_module {
+  version "1.0.0"
+  description "RLN Merkle Root Provider Module (cross-module contract for libp2p_module)"
+
+  method get_valid_roots(rln_account_id_hex: tstr) -> tstr
+  method get_merkle_proofs(config_account_id: tstr, leaf_indices_json: tstr) -> tstr
+  method generate_identity(wallet_account_id: tstr) -> tstr
+  method compute_rate_commitment(id_commitment_hex: tstr, rate_limit: int) -> tstr
+  method register_member(config_account_id: tstr, user_holding_account_id: tstr, id_commitment_hex: tstr, rate_limit: int) -> tstr
+  method is_member_registered(config_account_id: tstr, id_commitment_hex: tstr) -> tstr
+}

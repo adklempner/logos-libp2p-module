@@ -2,7 +2,9 @@
 
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <sstream>
 #include <thread>
 
 using json = nlohmann::json;
@@ -57,6 +59,19 @@ Libp2pModuleImpl::Libp2pModuleImpl(const Libp2pModuleOptions& options)
     m_libp2pConfig.transport = options.transport;
 
     m_addrs = options.addrs;
+    // Fallback: when the daemon constructs us with no explicit listen addrs
+    // (the default), honor LIBP2P_LISTEN_ADDRS (comma-separated multiaddrs) so a
+    // node can be made reachable across containers (e.g. /ip4/0.0.0.0/tcp/9000).
+    // Default behavior (loopback, ephemeral) is unchanged when the env is unset.
+    if (m_addrs.empty()) {
+        if (const char* env = std::getenv("LIBP2P_LISTEN_ADDRS")) {
+            std::string s(env), item;
+            std::stringstream ss(s);
+            while (std::getline(ss, item, ',')) {
+                if (!item.empty()) m_addrs.push_back(item);
+            }
+        }
+    }
     if (!m_addrs.empty()) {
         m_addrsPtr.reserve(m_addrs.size());
         for (const auto& addr : m_addrs) {
@@ -125,6 +140,8 @@ Libp2pModuleImpl::Libp2pModuleImpl(const Libp2pModuleOptions& options)
 
 Libp2pModuleImpl::~Libp2pModuleImpl() {
     try {
+        stopRlnRefreshTimer();
+
         std::vector<uint64_t> streamIds;
         {
             std::shared_lock<std::shared_mutex> lock(m_streamsLock);
@@ -178,6 +195,7 @@ StdLogosResult Libp2pModuleImpl::start() {
 }
 
 StdLogosResult Libp2pModuleImpl::stop() {
+    stopRlnRefreshTimer();
     return callSync("Failed to stop libp2p", [&](SyncPromise* p) {
         return libp2p_stop(ctx, &Libp2pModuleImpl::promiseCallback, p);
     });
