@@ -21,6 +21,7 @@
 extern "C" {
 #include "lib/libp2p.h"
 #include "lib/libp2p_mix_rln.h"
+#include "lib/libp2p_gifter.h"
 }
 
 // LogosAPI is the cross-module client factory; forward-declared so this
@@ -182,6 +183,25 @@ public:
     // thread and deadlocked against the QtRO owner-thread marshaling.
     StdLogosResult rlnRefreshProof();
 
+    // RLN membership gifter (allocation, LIP-158). The gifter node holds the
+    // funded wallet and registers OTHER nodes' identity commitments on-chain
+    // after authenticating them, so clients never fund/sign their own
+    // registration. Args are a single JSON object (universal-codegen QtRO
+    // dispatch drops multi-string signatures).
+    //
+    // rlnGifterServe: mount /logos/rln/membership/1.0.0 as the gifter.
+    //   JSON keys: {"config": <configAccount>, "wallet": <funded holding acct>,
+    //              "allowlist": [<0x-hex eth address>, ...]}  (empty allowlist
+    //              = open, no auth).
+    StdLogosResult rlnGifterServe(const std::string& argsJson);
+    // rlnGifterRequest: obtain a membership from a gifter (client side).
+    //   JSON keys: {"gifterPeerId": <base58>, "gifterMultiaddr": <str>,
+    //              "config": <configAccount>, "seed": <32-byte hex>,
+    //              "authKey": <32-byte hex secp256k1 priv, optional>,
+    //              "rate": <int>}. Generates the identity locally, requests the
+    //   allocation, and adopts the granted leaf (rlnSetIdentity + refresh).
+    StdLogosResult rlnGifterRequest(const std::string& argsJson);
+
     StdLogosResult discoStart();
     StdLogosResult discoStop();
     StdLogosResult discoStartAdvertising(const std::string& serviceId,
@@ -295,6 +315,27 @@ private:
     QTimer* m_rlnRefreshTimer = nullptr;
     void startRlnRefreshTimer();
     void stopRlnRefreshTimer();
+
+    // Gifter (server side): the funded config/wallet accounts this node signs
+    // registrations with, and a Qt-thread drain timer. The gifter register
+    // callback fires on the libp2p thread (where cross-module QtRO calls
+    // deadlock, same as the rln fetcher), so it only enqueues; the timer drains
+    // the queue on the module's Qt thread where register_member is safe.
+    std::string m_gifterConfig;
+    std::string m_gifterWallet;
+    struct GifterJob {
+        uint64_t handle;
+        std::string idCommitment;
+        int rate;
+    };
+    std::mutex m_gifterQueueMutex;
+    std::queue<GifterJob> m_gifterQueue;
+    QTimer* m_gifterTimer = nullptr;
+    static void gifterRegisterCallback(uint64_t handle, const char* idCommitmentHex,
+                                       uint64_t rateLimit, void* userData);
+    void gifterDrainQueue();
+    void gifterDoRegister(uint64_t handle, const std::string& idCommitment, int rate);
+    void stopGifterTimer();
     // Resolves the LogosAPI: prefers the explicit initLogos(hex) handle, else
     // lazily takes it from the LogosModuleContext mixin (modules().api), which
     // the framework populates in daemon mode. Returns null if neither is set.

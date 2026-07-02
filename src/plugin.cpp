@@ -141,6 +141,7 @@ Libp2pModuleImpl::Libp2pModuleImpl(const Libp2pModuleOptions& options)
 Libp2pModuleImpl::~Libp2pModuleImpl() {
     try {
         stopRlnRefreshTimer();
+        stopGifterTimer();
 
         std::vector<uint64_t> streamIds;
         {
@@ -196,6 +197,7 @@ StdLogosResult Libp2pModuleImpl::start() {
 
 StdLogosResult Libp2pModuleImpl::stop() {
     stopRlnRefreshTimer();
+    stopGifterTimer();
     return callSync("Failed to stop libp2p", [&](SyncPromise* p) {
         return libp2p_stop(ctx, &Libp2pModuleImpl::promiseCallback, p);
     });

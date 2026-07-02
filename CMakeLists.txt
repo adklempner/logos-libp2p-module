@@ -17,6 +17,7 @@ logos_module(
         src/stream.cpp
         src/mix.cpp
         src/rln.cpp
+        src/gifter.cpp
         src/gossipsub.cpp
         src/service_discovery.cpp
         src/custom_handlers.cpp
