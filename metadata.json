@@ -11,7 +11,12 @@
     },
     "category": "protocol",
     "main": "libp2p_module_plugin",
-    "dependencies": [],
+    "dependencies": ["liblogos_rln_module"],
+    "dependency_overrides": {
+        "liblogos_rln_module": {
+            "file": "src/liblogos_rln_module.lidl"
+        }
+    },
     "include": ["libp2p.so", "libp2p.dylib", "libp2p.dll"],
     "capabilities": [],
 

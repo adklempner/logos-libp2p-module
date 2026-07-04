@@ -1,7 +1,10 @@
 #include "plugin.h"
 
+#include "logos_api.h"
+
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <sstream>
 #include <thread>
@@ -102,6 +105,19 @@ void Libp2pModuleImpl::applyOptions(const Libp2pModuleOptions& options) {
     m_libp2pConfig.transport = options.transport;
 
     m_addrs = options.addrs;
+    // Fallback: when the daemon constructs us with no explicit listen addrs
+    // (the default), honor LIBP2P_LISTEN_ADDRS (comma-separated multiaddrs) so a
+    // node can be made reachable across containers (e.g. /ip4/0.0.0.0/tcp/9000).
+    // Default behavior (loopback, ephemeral) is unchanged when the env is unset.
+    if (m_addrs.empty()) {
+        if (const char* env = std::getenv("LIBP2P_LISTEN_ADDRS")) {
+            std::string s(env), item;
+            std::stringstream ss(s);
+            while (std::getline(ss, item, ',')) {
+                if (!item.empty()) m_addrs.push_back(item);
+            }
+        }
+    }
     if (m_addrs.empty()) {
         m_addrs.push_back(defaultListenAddr(options.transport));
     }
@@ -254,7 +270,14 @@ void Libp2pModuleImpl::destroyHandle(libp2p_ctx_t* handle) {
 
 Libp2pModuleImpl::~Libp2pModuleImpl() {
     try {
+        stopRlnRefreshTimer();
+        stopGifterTimer();
         destroyContext();
+        if (m_ownsLogosAPI) {
+            delete m_logosAPI;
+            m_logosAPI = nullptr;
+            m_ownsLogosAPI = false;
+        }
     } catch (...) {}
 }
 
@@ -270,6 +293,8 @@ StdLogosResult Libp2pModuleImpl::start() {
 }
 
 StdLogosResult Libp2pModuleImpl::stop() {
+    stopRlnRefreshTimer();
+    stopGifterTimer();
     return callSync("Failed to stop libp2p", [&](SyncPromise* p) {
         return libp2p_stop(ctx, &Libp2pModuleImpl::promiseCallback, p);
     });

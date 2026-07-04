@@ -59,21 +59,45 @@
     },
     "libp2p": {
       "inputs": {
+        "libp2p_mix": "libp2p_mix",
+        "logos_rln_gifter": "logos_rln_gifter",
         "nixpkgs": "nixpkgs"
       },
       "locked": {
-        "lastModified": 1782408105,
-        "narHash": "sha256-8x7ZG0hd29de47hNMaX4eP23gvbMdjD3hhW+nk5RyoM=",
-        "owner": "vacp2p",
-        "repo": "nim-libp2p",
-        "rev": "7c73484cc0c57a5f649dd3d277cef1c7c4de28f0",
-        "type": "github"
+        "lastModified": 1783131968,
+        "narHash": "sha256-oL9MT2CfqAPjii0Dto9Zq8u1t7C9YfHZH/ItsldHVLY=",
+        "ref": "feat/cbind-rln",
+        "rev": "12d628485cd9907a01e4bef72500395b2cf67ec6",
+        "revCount": 22,
+        "type": "git",
+        "url": "file:///Users/arseniy/Waku/Logos/mix-rln-spam-protection-plugin"
       },
       "original": {
-        "owner": "vacp2p",
-        "ref": "feat/cbind/xpr-decode",
-        "repo": "nim-libp2p",
-        "type": "github"
+        "ref": "feat/cbind-rln",
+        "type": "git",
+        "url": "file:///Users/arseniy/Waku/Logos/mix-rln-spam-protection-plugin"
+      }
+    },
+    "libp2p_mix": {
+      "inputs": {
+        "nixpkgs": [
+          "libp2p",
+          "nixpkgs"
+        ]
+      },
+      "locked": {
+        "lastModified": 1783127842,
+        "narHash": "sha256-ZiL68mRuCOddqG93UZp41Ztht29SfQPC2LI07UElvao=",
+        "ref": "rebase/mix-cbind",
+        "rev": "54e61254b0fb11400b92b304c52108145a2248d6",
+        "revCount": 90,
+        "type": "git",
+        "url": "file:///Users/arseniy/Waku/Logos/nim-libp2p-mix"
+      },
+      "original": {
+        "ref": "rebase/mix-cbind",
+        "type": "git",
+        "url": "file:///Users/arseniy/Waku/Logos/nim-libp2p-mix"
       }
     },
     "logos-capability-module": {
@@ -32108,6 +32132,23 @@
         "owner": "logos-co",
         "repo": "logos-view-module-runtime",
         "type": "github"
+      }
+    },
+    "logos_rln_gifter": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1783131941,
+        "narHash": "sha256-JrKE6EHQcQKj+MLkeGKeUFSp/hYqUVxxXcrjZlJfyhk=",
+        "ref": "master",
+        "rev": "9793e0be628fde067582ac92f8fa3a3ed460693d",
+        "revCount": 1,
+        "type": "git",
+        "url": "file:///Users/arseniy/Waku/Logos/logos-rln-gifter"
+      },
+      "original": {
+        "ref": "master",
+        "type": "git",
+        "url": "file:///Users/arseniy/Waku/Logos/logos-rln-gifter"
       }
     },
     "logoscore-cli": {

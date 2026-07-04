@@ -3,7 +3,7 @@
 
   inputs = {
     logos-module-builder.url = "github:logos-co/logos-module-builder";
-    libp2p.url = "github:vacp2p/nim-libp2p/feat/cbind/xpr-decode";
+    libp2p.url = "git+file:///Users/arseniy/Waku/Logos/mix-rln-spam-protection-plugin?ref=feat/cbind-rln";
 
     openmetrics-module = {
       url = "github:logos-co/openmetrics-module";
@@ -20,7 +20,7 @@
       externalLibInputs = {
         libp2p = {
           input = inputs.libp2p;
-          packages.default = "cbind";
+          packages.default = "cbind-rln";
         };
       };
 

@@ -38,6 +38,10 @@ if(LIBP2P_PATH)
             ../src/callbacks.cpp
             ../src/kademlia.cpp
             ../src/stream.cpp
+            ../src/mix.cpp
+            ../src/rln.cpp
+            ../src/rln_client.cpp
+            ../src/gifter.cpp
             ../src/gossipsub.cpp
             ../src/service_discovery.cpp
             ../src/custom_handlers.cpp
@@ -50,6 +54,7 @@ if(LIBP2P_PATH)
             integration.cpp
             integration_gossipsub.cpp
             integration_kad.cpp
+            integration_rln.cpp
             integration_service_discovery.cpp
             custom_handlers.cpp
             integration_peerstore.cpp
