@@ -122,8 +122,56 @@ StdLogosResult Libp2pModuleImpl::rlnEnable(const std::string& configJson) {
     if (libp2p_mix_rln_set_fetcher(&Libp2pModuleImpl::rlnFetcherTrampoline, this) != 0) {
         return {false, {}, "libp2p_mix_rln_set_fetcher failed"};
     }
+    if (libp2p_mix_rln_set_refresh_requester(
+            &Libp2pModuleImpl::rlnRefreshRequesterTrampoline, this) != 0) {
+        return {false, {}, "libp2p_mix_rln_set_refresh_requester failed"};
+    }
     ensureLogosAPI();
+    // Every node that verifies proofs needs the drain (not just registered
+    // senders), so it starts here rather than in rlnRegister.
+    startRlnRootsDrainTimer();
     return {true, {}, ""};
+}
+
+// Runs on the libp2p thread when proof verification misses the root window.
+// Flag-set ONLY — any blocking or cross-module (QtRO) call here would stall
+// the chronos loop or deadlock against owner-thread marshaling.
+void Libp2pModuleImpl::rlnRefreshRequesterTrampoline(void* userData) {
+    auto* self = static_cast<Libp2pModuleImpl*>(userData);
+    if (self) self->m_rlnRefreshRequested.store(true);
+}
+
+void Libp2pModuleImpl::startRlnRootsDrainTimer() {
+    if (m_rlnRootsDrainTimer) return;  // already running (re-enable is a no-op)
+
+    // 200ms keeps worst-case flag-to-push latency well inside nim's 3s
+    // awaitRootRefresh window while staying idle-cheap (exchange(false) only).
+    m_rlnRootsDrainTimer = new QTimer();
+    m_rlnRootsDrainTimer->setInterval(200);
+    // Same 3-arg connect pattern as startRlnRefreshTimer: lambda runs on the
+    // timer's (Qt/module) thread where cross-module calls are safe.
+    QObject::connect(m_rlnRootsDrainTimer, &QTimer::timeout, m_rlnRootsDrainTimer,
+                     [this]() { rlnRootsDrain(); });
+    m_rlnRootsDrainTimer->start();
+}
+
+void Libp2pModuleImpl::stopRlnRootsDrainTimer() {
+    if (!m_rlnRootsDrainTimer) return;
+    m_rlnRootsDrainTimer->stop();
+    m_rlnRootsDrainTimer->deleteLater();
+    m_rlnRootsDrainTimer = nullptr;
+}
+
+void Libp2pModuleImpl::rlnRootsDrain() {
+    if (!m_rlnRefreshRequested.exchange(false)) return;
+    if (m_rlnConfigAccount.empty()) return;
+
+    RlnModuleClient rln(ensureLogosAPI());
+    const std::string roots = rln.get_valid_roots(m_rlnConfigAccount);
+    // Empty = transient read failure; the nim side re-requests after its
+    // throttle interval, so dropping the flag here is safe.
+    if (roots.empty()) return;
+    libp2p_mix_rln_set_valid_roots(roots.c_str());
 }
 
 StdLogosResult Libp2pModuleImpl::rlnSetIdentity(const std::string& idSecretHashHex,

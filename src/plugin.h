@@ -386,6 +386,19 @@ private:
     void startRlnRefreshTimer();
     void stopRlnRefreshTimer();
 
+    // On-demand valid-roots drain: nim's verifyProof requests a refresh (via
+    // the trampoline below — libp2p thread, flag-set ONLY) when a proof
+    // references a root outside its local window; this Qt-thread timer drains
+    // the flag with one get_valid_roots read and pushes the result back via
+    // libp2p_mix_rln_set_valid_roots. A single atomic flag (not a queue like
+    // the gifter's) because concurrent requests coalesce into one read.
+    std::atomic<bool> m_rlnRefreshRequested{false};
+    QTimer* m_rlnRootsDrainTimer = nullptr;
+    static void rlnRefreshRequesterTrampoline(void* userData);
+    void startRlnRootsDrainTimer();
+    void stopRlnRootsDrainTimer();
+    void rlnRootsDrain();
+
     // Gifter (server side): the funded config/wallet accounts this node signs
     // registrations with, and a Qt-thread drain timer. The gifter register
     // callback fires on the libp2p thread (where cross-module QtRO calls

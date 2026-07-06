@@ -271,6 +271,7 @@ void Libp2pModuleImpl::destroyHandle(libp2p_ctx_t* handle) {
 Libp2pModuleImpl::~Libp2pModuleImpl() {
     try {
         stopRlnRefreshTimer();
+        stopRlnRootsDrainTimer();
         stopGifterTimer();
         destroyContext();
         if (m_ownsLogosAPI) {
@@ -294,6 +295,7 @@ StdLogosResult Libp2pModuleImpl::start() {
 
 StdLogosResult Libp2pModuleImpl::stop() {
     stopRlnRefreshTimer();
+    stopRlnRootsDrainTimer();
     stopGifterTimer();
     return callSync("Failed to stop libp2p", [&](SyncPromise* p) {
         return libp2p_stop(ctx, &Libp2pModuleImpl::promiseCallback, p);

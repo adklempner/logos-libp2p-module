@@ -3,7 +3,7 @@
 
   inputs = {
     logos-module-builder.url = "github:logos-co/logos-module-builder";
-    libp2p.url = "git+file:///Users/arseniy/Waku/Logos/mix-rln-spam-protection-plugin?ref=feat/cbind-rln";
+    libp2p.url = "git+file:///Users/arseniy/Waku/Logos/mix-rln-spam-protection-plugin?ref=feat/on-demand-roots";
 
     openmetrics-module = {
       url = "github:logos-co/openmetrics-module";
