@@ -1,6 +1,6 @@
 #include "plugin.h"
 
-#include <algorithm>
+#include <ctime>
 #include <string>
 #include <utility>
 
@@ -13,12 +13,10 @@
 using json = nlohmann::json;
 
 // Cross-module RLN calls go over the LogosAPI/QtRO transport (see
-// rln_client.h — the deployed rln module predates logos-protocol, so the
-// builder's LpClient path cannot reach it). A host may inject a handle via
-// initLogos(hex); otherwise the module process lazily constructs its own
-// LogosAPI (registry discovery is process-global). Construction must happen
-// on the Qt thread — rlnEnable warms it up so the drain timer only ever
-// reuses the existing instance.
+// rln_client.h). A host may inject a handle via initLogos(hex); otherwise the
+// module process lazily constructs its own LogosAPI (registry discovery is
+// process-global). Construction must happen on the Qt thread — rlnEnable
+// warms it up so the drain timer only ever reuses the existing instance.
 LogosAPI* Libp2pModuleImpl::ensureLogosAPI() {
     if (!m_logosAPI) {
         m_logosAPI = new LogosAPI(QStringLiteral("libp2p_module"));
@@ -40,6 +38,45 @@ bool Libp2pModuleImpl::initLogos(const std::string& apiHandleHex) {
     return true;
 }
 
+namespace {
+// Fetch replies carry failures in-band as the module's tstr-dialect envelope
+// {"error":{"class","kind","message"}}, so the mix layer switches on the same
+// typed object in every path.
+std::string fetchError(const char* cls, const char* kind, const std::string& message) {
+    return json{{"error", {{"class", cls}, {"kind", kind}, {"message", message}}}}.dump();
+}
+
+std::string transportError(const std::string& message) {
+    return fetchError("transient", "client_failure", message);
+}
+
+// Serves a "generate_proof" fetch: params {"signal_hex":…} (a bare JSON
+// string is tolerated as the hex). The proof's epoch binds to the CALLER's
+// Unix-seconds clock — this module is the sending consumer, so now() is the
+// timestamp the message carries.
+std::string serveGenerateProof(RlnModuleClient& rln, const std::string& registryId,
+                               const std::string& rlnIdentifierHex,
+                               const std::string& paramsJson) {
+    std::string signalHex;
+    const json p = json::parse(paramsJson, nullptr, false);
+    if (p.is_object() && p.contains("signal_hex") && p["signal_hex"].is_string()) {
+        signalHex = p["signal_hex"].get<std::string>();
+    } else if (p.is_string()) {
+        signalHex = p.get<std::string>();
+    }
+    if (signalHex.empty()) {
+        return fetchError("permanent", "invalid_argument",
+                          "generate_proof: params carry no signal_hex");
+    }
+
+    const std::string ts = std::to_string(static_cast<long long>(std::time(nullptr)));
+    auto r = rln.generateProof(registryId, rlnIdentifierHex, signalHex, ts);
+    if (r.ok) return r.value;  // the RateLimitProof object, verbatim
+    // r.error is always a valid JSON object dump (rln_client guarantees it).
+    return "{\"error\":" + r.error + "}";
+}
+}  // namespace
+
 // Runs on the Nim dispatch (libp2p) thread. Enqueue ONLY — any blocking or
 // cross-module (QtRO) call here would stall the chronos loop or deadlock
 // against owner-thread marshaling. The Qt-thread drain timer serves the
@@ -58,15 +95,22 @@ void Libp2pModuleImpl::onRlnFetchRequest(const RlnFetchRequestEvent* evt, void* 
 }
 
 StdLogosResult Libp2pModuleImpl::rlnEnable(const std::string& configJson) {
-    // Capture the LEZ config account so rlnRegister can reuse it, and so a
-    // host that only calls rlnEnable still has it available.
+    // The scope every membership-module call is made under; required — no
+    // default scope exists on that wire.
     try {
         auto j = json::parse(configJson);
-        if (j.contains("configAccount")) m_rlnConfigAccount = j["configAccount"].get<std::string>();
-        if (j.contains("epochDurationSeconds"))
-            m_rlnEpochSeconds = j["epochDurationSeconds"].get<double>();
+        m_rlnRegistryId = j.at("registry_id").get<std::string>();
+        m_rlnIdentifierHex = j.at("rln_identifier_hex").get<std::string>();
+        m_rlnEpochSizeSec = j.value("epoch_size_sec", static_cast<int64_t>(10));
     } catch (...) {
-        return {false, {}, "invalid config json"};
+        return {false, {},
+                "rlnEnable: bad config json (need {registry_id, rln_identifier_hex}, "
+                "optional epoch_size_sec)"};
+    }
+    if (m_rlnRegistryId.empty() || m_rlnIdentifierHex.empty() || m_rlnEpochSizeSec <= 0) {
+        return {false, {},
+                "rlnEnable: registry_id and rln_identifier_hex must be non-empty and "
+                "epoch_size_sec positive"};
     }
 
     // rlnEnable must precede start() (spam protection cannot be toggled on a
@@ -83,10 +127,23 @@ StdLogosResult Libp2pModuleImpl::rlnEnable(const std::string& configJson) {
     if (!res.success) return res;
 
     ensureLogosAPI();
+    // Configure the membership module (epoch base + warm the registry's root
+    // window). A failure here (module not up yet) is non-fatal: the refresh
+    // poller retries until start() lands.
+    rlnStartModule();
     // Every node that verifies proofs needs the drain (not just registered
-    // senders), so it starts here rather than in rlnRegister.
+    // senders).
     startRlnFetchDrainTimer();
+    startRlnRefreshTimer();
     return {true, {}, ""};
+}
+
+bool Libp2pModuleImpl::rlnStartModule() {
+    RlnModuleClient rln(ensureLogosAPI());
+    const json cfg{{"epoch_size_sec", m_rlnEpochSizeSec},
+                   {"registries", json::array({m_rlnRegistryId})}};
+    m_rlnModuleStarted = rln.start(cfg.dump()).ok;
+    return m_rlnModuleStarted;
 }
 
 void Libp2pModuleImpl::startRlnFetchDrainTimer() {
@@ -131,52 +188,59 @@ void Libp2pModuleImpl::rlnFetchDrain() {
     }
     if (pending.empty()) return;
 
+    RlnModuleClient rln(ensureLogosAPI());
+
     // One get_valid_roots read serves every queued roots request in this pass
     // plus the proactive SetValidRoots push below.
-    std::string roots;
+    std::string rootsReply;  // fetch-contract payload: roots object or {"error":…}
+    std::string rootsJson;   // the module's {"valid_roots":[…]} when the read succeeded
     bool readRoots = false;
     auto fetchRoots = [&]() -> const std::string& {
         if (!readRoots) {
             readRoots = true;
-            if (!m_rlnConfigAccount.empty()) {
-                RlnModuleClient rln(ensureLogosAPI());
-                roots = rln.get_valid_roots(m_rlnConfigAccount);
+            const std::string raw = rln.getValidRoots(m_rlnRegistryId);
+            if (raw.empty()) {
+                rootsReply =
+                    transportError("get_valid_roots: no reply from liblogos_rln_module");
+            } else {
+                // {"valid_roots":[…]} or the module's in-band {"error":…} —
+                // both already the fetch-contract shape, pass through verbatim.
+                rootsReply = raw;
+                const json j = json::parse(raw, nullptr, false);
+                if (j.is_object() && j.contains("valid_roots")) rootsJson = raw;
             }
         }
-        return roots;
+        return rootsReply;
     };
 
     for (const auto& req : pending) {
-        std::string result, error;
+        std::string payload;
         if (req.method == "get_valid_roots") {
-            result = fetchRoots();
-            if (result.empty()) {
-                error = "rln fetch: no valid roots available (config account unset or read failed)";
-            }
+            payload = fetchRoots();
         } else if (req.method == "generate_proof") {
-            // The deployed rln module's wire (rln_client.h) exposes no proof
-            // generation; the send that triggered this fetch fails and the
-            // next send re-requests. Serving this lands with the rln-module
-            // API migration.
-            error = "rln fetch: generate_proof not served by this host";
+            payload = serveGenerateProof(rln, m_rlnRegistryId, m_rlnIdentifierHex,
+                                         req.params);
         } else {
-            error = "rln fetch: unknown method '" + req.method + "'";
+            payload = fetchError("permanent", "invalid_argument",
+                                 "unknown rln fetch method '" + req.method + "'");
         }
-        rlnFetchReply(req.requestId, error, result);
+        rlnFetchReply(req.requestId, "", payload);
     }
 
-    // Keep the verifier's window fresh off the same read. Empty = transient
-    // read failure; nim re-requests after its throttle interval, so dropping
-    // it here is safe.
-    if (readRoots && !roots.empty()) {
+    // Keep the verifier's window fresh off the same read. A failed read is
+    // dropped here: nim re-requests after its throttle interval.
+    if (!rootsJson.empty()) {
         callSync("Failed to set valid roots", [&](SyncPromise* p) {
-            return libp2p_ctx_rln_mix_set_valid_roots(ctx, nimffi_str(roots.c_str()),
+            return libp2p_ctx_rln_mix_set_valid_roots(ctx, nimffi_str(rootsJson.c_str()),
                                                       &Libp2pModuleImpl::cbBool, p);
         });
     }
 }
 
 StdLogosResult Libp2pModuleImpl::rlnIsReady() {
+    // Proofs are only servable once the scope's membership is active in the
+    // membership module; the flag is latched by the refresh poller.
+    if (!m_rlnMembershipActive) return {true, false, ""};
     return callSyncWith("Failed to query rln readiness",
         [&](SyncPromise* p) {
             return libp2p_ctx_rln_mix_is_ready(ctx, &Libp2pModuleImpl::cbBoolValue, p);
@@ -187,88 +251,35 @@ StdLogosResult Libp2pModuleImpl::rlnIsReady() {
 }
 
 StdLogosResult Libp2pModuleImpl::rlnRegister(const std::string& argsJson) {
-    std::string configAccount, holdingAccount, seed;
-    int rate = 0;
-    try {
-        auto a = json::parse(argsJson);
-        configAccount = a.at("config").get<std::string>();
-        holdingAccount = a.at("wallet").get<std::string>();
-        rate = a.at("rate").get<int>();
-        // Optional: decouple the identity SEED from the funding/signing account.
-        // generate_identity is a pure function of 32 bytes of entropy, while
-        // register_member uses `wallet` only as the tx funder/signer. Passing a
-        // distinct seed per node lets ONE funded account register N distinct
-        // identities (needed for multi-node per-hop mix RLN). Defaults to wallet.
-        seed = a.value("seed", holdingAccount);
-    } catch (...) {
-        return {false, {}, "rlnRegister: bad args json (need {config,wallet,rate}, optional seed)"};
-    }
-
-    LogosAPI* api = ensureLogosAPI();
-    RlnModuleClient rln(api);
-
-    // 1. Derive the identity (idCommitment) from the seed; idCommitment is the
-    //    on-chain leaf.
-    const std::string idJson = rln.generate_identity(seed);
-    if (idJson.empty()) return {false, {}, "generate_identity failed"};
-
-    std::string idCommitment;
-    try {
-        auto j = json::parse(idJson);
-        idCommitment = j.at("id_commitment").get<std::string>();
-    } catch (...) {
-        return {false, {}, "generate_identity: bad response"};
-    }
-
-    // 2. Register the membership on-chain (wallet must be open + synced).
-    const std::string regJson =
-        rln.register_member(configAccount, holdingAccount, idCommitment, rate);
-    if (regJson.empty()) return {false, {}, "register_member failed"};
-
-    int64_t leafIndex = -1;
-    try {
-        auto j = json::parse(regJson);
-        leafIndex = j.at("leaf_index").get<int64_t>();
-    } catch (...) {
-        return {false, {}, "register_member: bad response"};
-    }
-
-    // 3. Record the leaf so rlnRefreshProof can fetch the matching proof once
-    //    the membership PDA is visible.
-    m_rlnLeafIndex = leafIndex;
-
-    // Drive readiness from inside the module: a Qt-thread timer fetches+pushes
-    // the proof until ready, then keeps it fresh. No host loop needed.
-    startRlnRefreshTimer();
-
-    return {true, json{{"leaf_index", leafIndex}, {"id_commitment", idCommitment}}, ""};
+    (void)argsJson;
+    return {false, {},
+            "rlnRegister: retired — register via liblogos_rln_module (the RLN "
+            "membership module) for the scope passed to rlnEnable; this module only "
+            "consumes proofs and roots for that scope"};
 }
 
 void Libp2pModuleImpl::startRlnRefreshTimer() {
-    if (m_rlnRefreshTimer) return;  // already running (re-register is a no-op)
+    if (m_rlnRefreshTimer) return;  // already running (re-enable is a no-op)
 
-    // Poll fast until the membership lands in the tree and the proof is cached,
-    // then back off to the epoch cadence to keep the root window fresh.
-    const int fastMs = 5000;
-    const int slowMs = std::max(1000, static_cast<int>(m_rlnEpochSeconds * 1000.0));
-
+    // Poll until the membership module accepted start() AND the scope's
+    // membership reads "active", then stop — everything afterwards is
+    // request-driven through the fetch drain.
     m_rlnRefreshTimer = new QTimer();
-    m_rlnRefreshTimer->setInterval(fastMs);
+    m_rlnRefreshTimer->setInterval(5000);
     // 3-arg connect with the timer as context: the lambda runs on the timer's
-    // (Qt/module) thread, where rlnRefreshProof's cross-module call is safe, and
-    // the connection drops automatically when the timer is destroyed.
-    QObject::connect(m_rlnRefreshTimer, &QTimer::timeout, m_rlnRefreshTimer,
-                     [this, slowMs]() {
-                         // Soft failures (membership not in tree yet) are expected
-                         // early; the next tick retries.
-                         rlnRefreshProof();
-                         auto ready = rlnIsReady();
-                         if (ready.success && ready.value.is_boolean() &&
-                             ready.value.get<bool>() &&
-                             m_rlnRefreshTimer->interval() != slowMs) {
-                             m_rlnRefreshTimer->setInterval(slowMs);
-                         }
-                     });
+    // (Qt/module) thread, where cross-module calls are safe, and the
+    // connection drops automatically when the timer is destroyed.
+    QObject::connect(m_rlnRefreshTimer, &QTimer::timeout, m_rlnRefreshTimer, [this]() {
+        if (!m_rlnModuleStarted && !rlnStartModule()) return;  // module not up yet
+        RlnModuleClient rln(ensureLogosAPI());
+        const std::string reply =
+            rln.getMembershipState(m_rlnRegistryId, m_rlnIdentifierHex);
+        const json j = json::parse(reply, nullptr, false);
+        if (j.is_object() && j.value("state", std::string()) == "active") {
+            m_rlnMembershipActive = true;
+            stopRlnRefreshTimer();
+        }
+    });
     m_rlnRefreshTimer->start();
 }
 
@@ -280,32 +291,7 @@ void Libp2pModuleImpl::stopRlnRefreshTimer() {
 }
 
 StdLogosResult Libp2pModuleImpl::rlnRefreshProof() {
-    if (m_rlnConfigAccount.empty()) return {false, {}, "RLN config account not set (call rlnEnable)"};
-    if (m_rlnLeafIndex < 0) return {false, {}, "no leaf index (call rlnRegister first)"};
-
-    RlnModuleClient rln(ensureLogosAPI());
-
-    // Fetch on THIS (Qt/RPC) thread — cross-module calls are safe here.
-    const std::string leafJson = "[" + std::to_string(m_rlnLeafIndex) + "]";
-    const std::string arr = rln.get_merkle_proofs(m_rlnConfigAccount, leafJson);
-    if (arr.empty()) return {false, {}, "get_merkle_proofs returned empty"};
-
-    // get_merkle_proofs returns a JSON array [{...}]; push element [0].
-    std::string proofObj;
-    try {
-        auto j = json::parse(arr);
-        if (!j.is_array() || j.empty()) return {false, {}, "no merkle proof available yet"};
-        proofObj = j[0].dump();
-    } catch (...) {
-        return {false, {}, "get_merkle_proofs: bad response"};
-    }
-
-    // The SetCachedProof request expects the raw proof blob as proofSize bytes
-    // of hex; the deployed rln module only serves the merkle proof JSON, so
-    // this push is rejected until the rln-module API migration serves a real
-    // proof.
-    return callSync("Failed to set cached proof", [&](SyncPromise* p) {
-        return libp2p_ctx_rln_mix_set_cached_proof(ctx, nimffi_str(proofObj.c_str()),
-                                                   &Libp2pModuleImpl::cbBool, p);
-    });
+    return {false, {},
+            "rlnRefreshProof: retired — module proving replaced the cached-proof "
+            "push (proofs are generated per message via the rln fetch bridge)"};
 }

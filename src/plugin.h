@@ -266,24 +266,22 @@ public:
     bool initLogos(const std::string& apiHandleHex);
 
     // Enable RLN spam protection on the mix protocol. configJson keys: the
-    // cbind reads `proofSize` (0 disables the proof field); `configAccount`
-    // and `epochDurationSeconds` are captured module-side for the fetch/
-    // refresh plumbing. MUST be called before mix mounts (spam protection
-    // changes the wire packet size).
+    // cbind reads `proofSize` (0 disables the proof field); `registry_id`
+    // (REQUIRED — the CAIP-10 registry) and `rln_identifier_hex` (REQUIRED —
+    // the application's 32-byte scope key) form the scope every membership-
+    // module call is made under; `epoch_size_sec` (optional, default 10) is
+    // the application rate-limit epoch forwarded to the module's start().
+    // MUST be called before mix mounts (spam protection changes the wire
+    // packet size).
     StdLogosResult rlnEnable(const std::string& configJson);
     StdLogosResult rlnIsReady();
-    // Self-registration (v1, no gifter): register this node's membership via
-    // the rln module and record the on-chain leaf for the proof refresh.
-    // Args are passed as a single JSON object so the call survives the
-    // universal-codegen QtRO dispatch (which only marshals single-string /
-    // (string,int) signatures cleanly — multi-string / int64 args are dropped).
-    // JSON keys: {"config": <configAccount>, "wallet": <holdingAccount>,
-    //             "rate": <int>}.
+    // Retired: registration lives in liblogos_rln_module (the RLN membership
+    // module) — register there for the scope passed to rlnEnable. Kept only
+    // to hold the QtRO method surface stable; always returns an error.
     StdLogosResult rlnRegister(const std::string& argsJson);
-    // Fetch this node's merkle proof from the rln module (on the Qt/RPC thread,
-    // where cross-module calls are safe) and push it via the SetCachedProof
-    // request. Call repeatedly after rlnRegister until rlnIsReady() is true —
-    // the membership takes a few blocks to land in the on-chain tree.
+    // Retired: module proving replaced the cached-proof push — proofs are
+    // generated per message via the rln fetch bridge. Kept only to hold the
+    // QtRO method surface stable; always returns an error.
     StdLogosResult rlnRefreshProof();
 
     StdLogosResult discoStart();
@@ -385,23 +383,32 @@ private:
     void emitEventSafe(const std::string& name, const std::string& data) const;
 
     // RLN: LogosAPI handle (set via initLogos) used to route the mix RLN
-    // fetch requests into the rln module, and the LEZ config-account those
-    // fetches query.
+    // fetch requests into the membership module, and the (registry_id,
+    // rln_identifier_hex) scope every call on that wire is made under
+    // (captured from rlnEnable's config — the module holds no default scope).
     LogosAPI* m_logosAPI = nullptr;
-    std::string m_rlnConfigAccount;
-    // This node's on-chain RLN membership leaf (set by rlnRegister), used by
-    // rlnRefreshProof to fetch the matching merkle proof.
-    int64_t m_rlnLeafIndex = -1;
-    // Keep-fresh cadence (seconds) for the proof-refresh timer once ready;
-    // captured from rlnEnable's epochDurationSeconds. The pre-ready phase polls
-    // faster (see startRlnRefreshTimer).
-    double m_rlnEpochSeconds = 10.0;
-    // Self-scheduling timer on the module's Qt thread (where cross-module calls
-    // are safe) that drives rlnRefreshProof after registration, so the module
-    // reaches and maintains readiness without a host-side refresh loop.
+    std::string m_rlnRegistryId;
+    std::string m_rlnIdentifierHex;
+    // Application rate-limit epoch (seconds) forwarded to the membership
+    // module's start(); every proof generator and verifier of a deployment
+    // must share it.
+    int64_t m_rlnEpochSizeSec = 10;
+    // Set once the membership module accepted start() for this scope's
+    // registry; retried by the refresh poller until then. Qt-thread only
+    // (timer + method dispatch share the thread).
+    bool m_rlnModuleStarted = false;
+    // Latched true when get_membership_state reports "active" for the scope;
+    // gates rlnIsReady. Qt-thread only.
+    bool m_rlnMembershipActive = false;
+    // Membership poller on the module's Qt thread (where cross-module calls
+    // are safe): retries the membership-module start() until accepted, polls
+    // the scope's membership state until "active", then stops itself.
     QTimer* m_rlnRefreshTimer = nullptr;
     void startRlnRefreshTimer();
     void stopRlnRefreshTimer();
+    // One start(config) call at the membership module: epoch base + root-
+    // window warm-up for the scope's registry. Sets m_rlnModuleStarted.
+    bool rlnStartModule();
 
     // On-demand fetch drain: when the nim spam-protection layer needs data
     // only the host can serve (a proof, a fresh valid-roots window), it fires

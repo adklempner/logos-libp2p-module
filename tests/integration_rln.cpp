@@ -19,30 +19,43 @@ LOGOS_TEST(rln_enable_and_readiness_gate) {
     LOGOS_ASSERT_FALSE(pre.value.get<bool>());
 
     // enable installs the spam-protection hook (proofSize > 0 keeps readiness
-    // gated on a cached proof).
+    // gated) and captures the (registry_id, rln_identifier_hex) scope for the
+    // membership-module calls. The cross-module start() is attempted but its
+    // failure (no membership module in this process) is non-fatal.
     auto en = node->rlnEnable(
         "{\"proofSize\":128,"
-        "\"epochDurationSeconds\":10.0,\"configAccount\":\"testacct\"}");
+        "\"registry_id\":\"logos:testnet:0011\","
+        "\"rln_identifier_hex\":\"0x0000000000000000000000000000000000000000000000000000000000000001\","
+        "\"epoch_size_sec\":10}");
     LOGOS_ASSERT_TRUE(en.success);
 
-    // No proof pushed yet -> not ready.
+    // Membership not active (no membership module) -> not ready.
     auto ready = node->rlnIsReady();
     LOGOS_ASSERT_TRUE(ready.success);
     LOGOS_ASSERT_FALSE(ready.value.get<bool>());
 
-    // Double-enable is rejected by the cbind rather than crashing.
+    // A config missing the required scope keys is rejected up front.
     LOGOS_ASSERT_FALSE(node->rlnEnable("{\"proofSize\":128}").success);
+
+    // Double-enable is rejected by the cbind rather than crashing.
+    LOGOS_ASSERT_FALSE(node->rlnEnable(
+        "{\"proofSize\":128,"
+        "\"registry_id\":\"logos:testnet:0011\","
+        "\"rln_identifier_hex\":\"0x0000000000000000000000000000000000000000000000000000000000000001\"}")
+        .success);
 
     LOGOS_ASSERT_TRUE(node->stop().success);
 }
 
-LOGOS_TEST(rln_register_requires_logos_api) {
+LOGOS_TEST(rln_retired_methods_fail_cleanly) {
     auto node = std::make_unique<Libp2pModuleImpl>(Libp2pModuleOptions{});
     LOGOS_ASSERT_TRUE(node->start().success);
 
-    // Without initLogos the cross-module register flow fails cleanly.
+    // Registration and the cached-proof push moved into the membership
+    // module; the retained QtRO surface reports the retirement as an error.
     auto reg = node->rlnRegister(R"({"config":"cfgacct","wallet":"holdacct","rate":100})");
     LOGOS_ASSERT_FALSE(reg.success);
+    LOGOS_ASSERT_FALSE(node->rlnRefreshProof().success);
 
     LOGOS_ASSERT_TRUE(node->stop().success);
 }
