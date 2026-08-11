@@ -875,11 +875,11 @@
         "nixpkgs": "nixpkgs"
       },
       "locked": {
-        "lastModified": 1786477447,
-        "narHash": "sha256-LJtuxUVhiiecRjhbi6FALKjO1JgrVJx3L0Gu2W3qSAk=",
+        "lastModified": 1786481890,
+        "narHash": "sha256-G3KILXDJq2F1yOTTbDSUbUhtIMg0mU/yVoMtPb5zlVY=",
         "ref": "feat/mix-rln-cbind",
-        "rev": "33294b162b2b2c1fd8abf7f36b8c4c2005edf5f8",
-        "revCount": 2567,
+        "rev": "07f7abf493b75c3350a45525ff62946ba5af1e6b",
+        "revCount": 2568,
         "type": "git",
         "url": "file:///Users/arseniy/Waku/Logos/nim-libp2p"
       },

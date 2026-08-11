@@ -101,6 +101,11 @@ StdLogosResult Libp2pModuleImpl::rlnEnable(const std::string& configJson) {
         auto j = json::parse(configJson);
         m_rlnRegistryId = j.at("registry_id").get<std::string>();
         m_rlnIdentifierHex = j.at("rln_identifier_hex").get<std::string>();
+        // Bare lowercase hex everywhere downstream: the module wire tolerates
+        // 0x but the cbind's decoder need not.
+        if (m_rlnIdentifierHex.rfind("0x", 0) == 0 || m_rlnIdentifierHex.rfind("0X", 0) == 0) {
+            m_rlnIdentifierHex = m_rlnIdentifierHex.substr(2);
+        }
         m_rlnEpochSizeSec = j.value("epoch_size_sec", static_cast<int64_t>(10));
     } catch (...) {
         return {false, {},
@@ -120,8 +125,16 @@ StdLogosResult Libp2pModuleImpl::rlnEnable(const std::string& configJson) {
         if (!created.success) return created;
     }
 
+    // The cbind speaks its own config vocabulary, not this method's: the mix
+    // wire proof is fixed at 301 bytes, and the verifier recomputes external
+    // nullifiers from rlnIdentifierHex — omitting it makes every peer proof
+    // fail verification.
+    const std::string cbindCfg = json{
+        {"proofSize", 301},
+        {"rlnIdentifierHex", m_rlnIdentifierHex},
+    }.dump();
     auto res = callSync("Failed to enable rln", [&](SyncPromise* p) {
-        return libp2p_ctx_rln_mix_enable(ctx, nimffi_str(configJson.c_str()),
+        return libp2p_ctx_rln_mix_enable(ctx, nimffi_str(cbindCfg.c_str()),
                                          &Libp2pModuleImpl::cbBool, p);
     });
     if (!res.success) return res;
