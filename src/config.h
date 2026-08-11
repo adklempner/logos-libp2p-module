@@ -32,6 +32,13 @@ struct Libp2pModuleOptions {
     bool mountKad = true;
     bool mountServiceDiscovery = true;
 
+    // Mix protocol mounting (applied on start, once listen addresses exist).
+    // Empty key/multiaddr let the nim side generate a key / use the first
+    // listen address.
+    bool mountMix = false;
+    std::string mixPrivKeyHex = {};
+    std::string mixMultiaddr = {};
+
     // Bounds on the per-topic backlog gossipsubNextMessage() drains; either at
     // 0 disables it. Keep the byte bound above gossipsubMaxMessageSize, since a
     // larger message never fits. See TopicQueues.
@@ -150,6 +157,9 @@ inline void apply(const nlohmann::json& j, Libp2pModuleOptions& o) {
     o.mountGossipsub = j.value("mountGossipsub", o.mountGossipsub);
     o.mountKad = j.value("mountKad", o.mountKad);
     o.mountServiceDiscovery = j.value("mountServiceDiscovery", o.mountServiceDiscovery);
+    o.mountMix = j.value("mountMix", o.mountMix);
+    o.mixPrivKeyHex = j.value("mixPrivKeyHex", o.mixPrivKeyHex);
+    o.mixMultiaddr = j.value("mixMultiaddr", o.mixMultiaddr);
     o.gossipsubQueueMaxMessages =
         parseNonNegative(j, "gossipsubQueueMaxMessages", o.gossipsubQueueMaxMessages);
     o.gossipsubQueueMaxBytes =

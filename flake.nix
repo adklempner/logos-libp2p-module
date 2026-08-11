@@ -3,7 +3,12 @@
 
   inputs = {
     logos-module-builder.url = "github:logos-co/logos-module-builder";
-    libp2p.url = "github:vacp2p/nim-libp2p/master";
+    # The libp2p external lib is the nim-libp2p fork's own cbind package: the
+    # nim-ffi generated binding carrying core libp2p plus the mix protocol and
+    # the mix-RLN spam-protection hook surface (rlnMix* requests + the
+    # on_rln_fetch_request event). Local path during bring-up; becomes the
+    # fork URL at push time.
+    libp2p.url = "git+file:///Users/arseniy/Waku/Logos/nim-libp2p?ref=feat/mix-rln-cbind";
 
     openmetrics-module = {
       url = "github:logos-co/openmetrics-module";

@@ -22,6 +22,9 @@ logos_module(
         src/kademlia.cpp
         src/stream.cpp
         src/protocol_bridge.cpp
+        src/mix.cpp
+        src/rln.cpp
+        src/rln_client.cpp
         src/gossipsub.cpp
         src/service_discovery.cpp
         src/custom_handlers.cpp

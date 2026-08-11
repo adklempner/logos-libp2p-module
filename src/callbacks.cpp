@@ -44,6 +44,12 @@ void Libp2pModuleImpl::cbBool(int ec, const bool*, const char* em, void* ud) {
     finishPromise(static_cast<SyncPromise*>(ud), replyBase(ec, em));
 }
 
+void Libp2pModuleImpl::cbBoolValue(int ec, const bool* reply, const char* em, void* ud) {
+    auto r = replyBase(ec, em);
+    if (r.ok && reply) r.data = *reply;
+    finishPromise(static_cast<SyncPromise*>(ud), std::move(r));
+}
+
 void Libp2pModuleImpl::cbBytes(int ec, const NimFfiBytes* reply, const char* em, void* ud) {
     auto r = replyBase(ec, em);
     if (r.ok && reply) r.buffer = nfBytes(*reply);

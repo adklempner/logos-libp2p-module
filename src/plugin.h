@@ -23,12 +23,14 @@
 
 #include "logos_json.h"
 #include "logos_result.h"
+#include <logos_module_context.h>
 
 // The nim-ffi generated header is header-only C: it declares the exported Nim
 // symbols inside its own `extern "C"` block and exposes the async API as
 // `static inline` wrappers plus C++-linkage callback typedefs. It must NOT be
 // wrapped in an extra `extern "C"` here, or the reply-callback typedefs would
 // take C linkage and no longer match the C++ static callbacks we pass in.
+// The mix and mix-RLN surface is part of this same generated header.
 #include <libp2p.h>
 
 #include "config.h"
@@ -44,6 +46,13 @@ inline constexpr int kNewContextTimeoutMs = 5000;
 // Added on top of a caller-supplied op timeout so the C++ await outlives the
 // libp2p operation it wraps instead of racing it.
 inline constexpr int kAwaitSlackMs = 5000;
+
+// LogosAPI is the cross-module client factory; forward-declared so this
+// codegen-scanned header stays free of Qt/SDK includes (rln.cpp pulls them).
+class LogosAPI;
+// QTimer is forward-declared for the same reason; the in-module proof-refresh
+// timer is created/used only in rln.cpp, which includes the Qt headers.
+class QTimer;
 
 // Result type for internal sync-over-async operations.
 struct SyncResult {
@@ -164,7 +173,7 @@ inline StdLogosResult jsonResult(const SyncResult& r, nlohmann::json emptyDefaul
     return {true, r.data, ""};
 }
 
-class Libp2pModuleImpl {
+class Libp2pModuleImpl : public LogosModuleContext {
 public:
     Libp2pModuleImpl(const Libp2pModuleOptions& options = Libp2pModuleOptions::load());
     ~Libp2pModuleImpl();
@@ -225,6 +234,58 @@ public:
     StdLogosResult kadGetProviders(const std::string& cid);
     StdLogosResult kadGetRandomRecords();
 
+    // Mix key material crosses the module boundary hex-encoded, matching the
+    // cbind's own key encoding.
+    StdLogosResult mixGeneratePrivKey();
+    StdLogosResult mixPublicKey(const std::string& privKeyHex);
+    // Mix dial methods take a single JSON-blob arg to survive the
+    // universal-codegen QtRO dispatch (which drops multi-string / int / uint
+    // signatures), same as mixSetNodeInfo. Keys per method:
+    //   mixDial:                 {peerId, multiaddr, proto}
+    //   mixDialWithReply:        {peerId, multiaddr, proto, expectReply, numSurbs}
+    //   mixRegisterDestReadBehavior: {proto, behavior, sizeParam}
+    //   mixNodepoolAdd:          {peerId, multiaddr, mixPubKey, libp2pPubKey}
+    //                            (mixPubKey/libp2pPubKey are hex-encoded keys)
+    StdLogosResult mixDial(const std::string& argsJson);
+    StdLogosResult mixDialWithReply(const std::string& argsJson);
+    StdLogosResult mixRegisterDestReadBehavior(const std::string& argsJson);
+    // Mounts the mix protocol with this node's routing identity — the
+    // call-time alternative to config-driven mounting (mountMix). Args are a
+    // single JSON object to survive the universal-codegen QtRO dispatch (which
+    // drops multi-string signatures): {"multiaddr": <str>, "mixPrivKeyHex":
+    // <64-hex-char curve25519 priv key>}.
+    StdLogosResult mixSetNodeInfo(const std::string& argsJson);
+    StdLogosResult mixNodepoolAdd(const std::string& argsJson);
+
+    /* ----------- RLN spam protection (LEZ-backed) ----------- */
+
+    // Wires the LogosAPI handle used to route the RLN fetcher into the rln
+    // module. Encoded as a hex string because the universal codegen doesn't
+    // recognise opaque pointer types directly (host passes
+    // QString::number(reinterpret_cast<quintptr>(api), 16)).
+    bool initLogos(const std::string& apiHandleHex);
+
+    // Enable RLN spam protection on the mix protocol. configJson keys: the
+    // cbind reads `proofSize` (0 disables the proof field); `configAccount`
+    // and `epochDurationSeconds` are captured module-side for the fetch/
+    // refresh plumbing. MUST be called before mix mounts (spam protection
+    // changes the wire packet size).
+    StdLogosResult rlnEnable(const std::string& configJson);
+    StdLogosResult rlnIsReady();
+    // Self-registration (v1, no gifter): register this node's membership via
+    // the rln module and record the on-chain leaf for the proof refresh.
+    // Args are passed as a single JSON object so the call survives the
+    // universal-codegen QtRO dispatch (which only marshals single-string /
+    // (string,int) signatures cleanly — multi-string / int64 args are dropped).
+    // JSON keys: {"config": <configAccount>, "wallet": <holdingAccount>,
+    //             "rate": <int>}.
+    StdLogosResult rlnRegister(const std::string& argsJson);
+    // Fetch this node's merkle proof from the rln module (on the Qt/RPC thread,
+    // where cross-module calls are safe) and push it via the SetCachedProof
+    // request. Call repeatedly after rlnRegister until rlnIsReady() is true —
+    // the membership takes a few blocks to land in the on-chain tree.
+    StdLogosResult rlnRefreshProof();
+
     StdLogosResult discoStart();
     StdLogosResult discoStop();
     StdLogosResult discoStartAdvertising(const std::string& serviceId, const std::string& serviceData, const std::string& advertisement);
@@ -268,6 +329,11 @@ private:
 
     SecureBytes m_privKey;
 
+    // Backing storage for the MixConfig string views (same lifetime rule as
+    // m_addrs: must outlive every libp2p_ctx_create call).
+    std::string m_mixPrivKeyHex;
+    std::string m_mixMultiaddr;
+
     // Creates a context from `cfg` without adopting it as the member `ctx`.
     SyncResult spawnContext(Libp2pConfig& cfg);
 
@@ -289,6 +355,9 @@ private:
     // (err_code, reply, err_msg) callback into a SyncResult and resolves the
     // promise handed in as user_data.
     static void cbBool(int ec, const bool* reply, const char* em, void* ud);
+    // Like cbBool, but keeps the reply value (for calls whose bool IS the
+    // answer, e.g. rln readiness) instead of treating it as a bare ack.
+    static void cbBoolValue(int ec, const bool* reply, const char* em, void* ud);
     static void cbBytes(int ec, const NimFfiBytes* reply, const char* em, void* ud);
     static void cbStr(int ec, const NimFfiStr* reply, const char* em, void* ud);
     static void cbRead(int ec, const ReadResponse* reply, const char* em, void* ud);
@@ -314,6 +383,57 @@ private:
     EmitEventFn m_emitEventSnapshot;
     void publishEmitEvent();
     void emitEventSafe(const std::string& name, const std::string& data) const;
+
+    // RLN: LogosAPI handle (set via initLogos) used to route the mix RLN
+    // fetch requests into the rln module, and the LEZ config-account those
+    // fetches query.
+    LogosAPI* m_logosAPI = nullptr;
+    std::string m_rlnConfigAccount;
+    // This node's on-chain RLN membership leaf (set by rlnRegister), used by
+    // rlnRefreshProof to fetch the matching merkle proof.
+    int64_t m_rlnLeafIndex = -1;
+    // Keep-fresh cadence (seconds) for the proof-refresh timer once ready;
+    // captured from rlnEnable's epochDurationSeconds. The pre-ready phase polls
+    // faster (see startRlnRefreshTimer).
+    double m_rlnEpochSeconds = 10.0;
+    // Self-scheduling timer on the module's Qt thread (where cross-module calls
+    // are safe) that drives rlnRefreshProof after registration, so the module
+    // reaches and maintains readiness without a host-side refresh loop.
+    QTimer* m_rlnRefreshTimer = nullptr;
+    void startRlnRefreshTimer();
+    void stopRlnRefreshTimer();
+
+    // On-demand fetch drain: when the nim spam-protection layer needs data
+    // only the host can serve (a proof, a fresh valid-roots window), it fires
+    // an on_rln_fetch_request event. The listener runs on the Nim dispatch
+    // (libp2p) thread and enqueues ONLY — any blocking or cross-module (QtRO)
+    // call there would stall the chronos loop or deadlock against owner-thread
+    // marshaling. This Qt-thread timer drains the queue, makes the cross-module
+    // reads (safe on the Qt thread), answers each request id via the
+    // rlnMixFetchReply request, and re-pushes fresh roots via the
+    // SetValidRoots request. Concurrent roots requests coalesce into one read,
+    // but every request id gets its own reply.
+    struct RlnFetchPending {
+        uint64_t requestId = 0;
+        std::string method;
+        std::string params;
+    };
+    std::mutex m_rlnFetchMutex;
+    std::deque<RlnFetchPending> m_rlnFetchQueue;
+    QTimer* m_rlnFetchDrainTimer = nullptr;
+    static void onRlnFetchRequest(const RlnFetchRequestEvent* evt, void* ud);
+    void startRlnFetchDrainTimer();
+    void stopRlnFetchDrainTimer();
+    void rlnFetchDrain();
+    // Fire-and-forget submit of a fetch answer; never blocks on the nim loop.
+    void rlnFetchReply(uint64_t requestId, const std::string& error,
+                       const std::string& resultJson);
+
+    // Resolves the LogosAPI used by the vendored RlnModuleClient transport:
+    // prefers the explicit initLogos(hex) handle, else lazily constructs one
+    // for this module process (Qt thread only — rlnEnable warms it up).
+    LogosAPI* ensureLogosAPI();
+    bool m_ownsLogosAPI = false;
 
     // Wraps the new-promise / invoke / await / clean-up dance shared by every
     // sync-over-async libp2p op. `invoke(SyncPromise*)` calls the cbinding and

@@ -11,8 +11,13 @@
     },
     "category": "protocol",
     "main": "libp2p_module_plugin",
-    "dependencies": [],
-    "include": ["libp2p.so", "libp2p.dylib", "libp2p.dll"],
+    "dependencies": ["liblogos_rln_module"],
+    "dependency_overrides": {
+        "liblogos_rln_module": {
+            "file": "src/liblogos_rln_module.lidl"
+        }
+    },
+    "include": ["liblibp2p.so", "liblibp2p.dylib", "liblibp2p.dll"],
     "capabilities": [],
 
     "config": {
@@ -36,6 +41,9 @@
             "mountGossipsub": "bool",
             "mountKad": "bool",
             "mountServiceDiscovery": "bool",
+            "mountMix": "bool — mount the mix protocol on start; default false. Call rlnEnable before start when spam protection is wanted (it changes the wire packet size).",
+            "mixPrivKeyHex": "string — x25519 mix private key, hex; omit to generate a fresh key. Needs mountMix.",
+            "mixMultiaddr": "string — multiaddr announced to the mix network; omit to use the node's first listen address. Needs mountMix.",
             "gossipsubQueueMaxMessages": "int — messages held per topic for gossipsubNextMessage; default 1024. Once full the newest message is dropped and counted in libp2p_module_gossipsub_queue_dropped_total.",
             "gossipsubQueueMaxBytes": "int — bytes held per topic for gossipsubNextMessage; default 4194304. Both bounds apply together, and a message larger than this bound never fits, so keep it above gossipsubMaxMessageSize. Set either bound to 0 to disable the queue for consumers that only read the gossipsubMessage event.",
             "gossipsubMaxMessageSize": "int — largest GossipSub message accepted or sent, in bytes; default 0 keeps the core 1 MiB limit. The ceiling is MAX_GOSSIPSUB_MESSAGE_SIZE (67108864).",

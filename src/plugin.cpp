@@ -1,7 +1,10 @@
 #include "plugin.h"
 
+#include "logos_api.h"
+
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <sstream>
 #include <thread>
@@ -107,6 +110,12 @@ void Libp2pModuleImpl::applyOptions(const Libp2pModuleOptions& options) {
     m_libp2pConfig.mountKad = options.mountKad;
     m_libp2pConfig.mountServiceDiscovery = options.mountServiceDiscovery;
 
+    m_mixPrivKeyHex = options.mixPrivKeyHex;
+    m_mixMultiaddr = options.mixMultiaddr;
+    m_libp2pConfig.mix.mount = options.mountMix;
+    m_libp2pConfig.mix.privKeyHex = nimffi_str(m_mixPrivKeyHex.c_str());
+    m_libp2pConfig.mix.multiaddr = nimffi_str(m_mixMultiaddr.c_str());
+
     m_libp2pConfig.muxer = MUXER_TYPE_MPLEX;
     m_libp2pConfig.transport = options.transport;
 
@@ -122,6 +131,19 @@ void Libp2pModuleImpl::applyOptions(const Libp2pModuleOptions& options) {
     m_libp2pConfig.autonatV2Server = options.autonatV2Server;
 
     m_addrs = options.addrs;
+    // Fallback: when the daemon constructs us with no explicit listen addrs
+    // (the default), honor LIBP2P_LISTEN_ADDRS (comma-separated multiaddrs) so a
+    // node can be made reachable across containers (e.g. /ip4/0.0.0.0/tcp/9000).
+    // Default behavior (loopback, ephemeral) is unchanged when the env is unset.
+    if (m_addrs.empty()) {
+        if (const char* env = std::getenv("LIBP2P_LISTEN_ADDRS")) {
+            std::string s(env), item;
+            std::stringstream ss(s);
+            while (std::getline(ss, item, ',')) {
+                if (!item.empty()) m_addrs.push_back(item);
+            }
+        }
+    }
     if (m_addrs.empty()) {
         m_addrs.push_back(defaultListenAddr(options.transport));
     }
@@ -203,6 +225,7 @@ StdLogosResult Libp2pModuleImpl::createContext() {
     // frees the listener boxes.
     libp2p_ctx_add_on_incoming_stream_listener(ctx, &Libp2pModuleImpl::onIncomingStream, this);
     libp2p_ctx_add_on_pubsub_message_listener(ctx, &Libp2pModuleImpl::onPubsubMessage, this);
+    libp2p_ctx_add_on_rln_fetch_request_listener(ctx, &Libp2pModuleImpl::onRlnFetchRequest, this);
 
     return {true, {}, ""};
 }
@@ -247,7 +270,14 @@ void Libp2pModuleImpl::destroyContext() {
 
 Libp2pModuleImpl::~Libp2pModuleImpl() {
     try {
+        stopRlnRefreshTimer();
+        stopRlnFetchDrainTimer();
         destroyContext();
+        if (m_ownsLogosAPI) {
+            delete m_logosAPI;
+            m_logosAPI = nullptr;
+            m_ownsLogosAPI = false;
+        }
     } catch (...) {}
 }
 
@@ -263,6 +293,8 @@ StdLogosResult Libp2pModuleImpl::start() {
 }
 
 StdLogosResult Libp2pModuleImpl::stop() {
+    stopRlnRefreshTimer();
+    stopRlnFetchDrainTimer();
     auto res = callSync("Failed to stop libp2p", [&](SyncPromise* p) {
         return libp2p_ctx_stop(ctx, &Libp2pModuleImpl::cbBool, p);
     });

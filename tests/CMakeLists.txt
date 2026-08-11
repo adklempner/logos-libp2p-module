@@ -27,7 +27,7 @@ logos_test(
 # Integration tests (real libp2p library)
 
 find_library(LIBP2P_PATH
-    NAMES libp2p.so libp2p.dylib
+    NAMES libp2p liblibp2p.so liblibp2p.dylib
     PATHS ${CMAKE_CURRENT_SOURCE_DIR}/../lib
     NO_DEFAULT_PATH)
 
@@ -44,6 +44,9 @@ if(LIBP2P_PATH)
             ../src/kademlia.cpp
             ../src/stream.cpp
             ../src/protocol_bridge.cpp
+            ../src/mix.cpp
+            ../src/rln.cpp
+            ../src/rln_client.cpp
             ../src/gossipsub.cpp
             ../src/service_discovery.cpp
             ../src/custom_handlers.cpp
@@ -56,6 +59,7 @@ if(LIBP2P_PATH)
             integration.cpp
             integration_gossipsub.cpp
             integration_kad.cpp
+            integration_rln.cpp
             integration_service_discovery.cpp
             custom_handlers.cpp
             integration_peerstore.cpp
