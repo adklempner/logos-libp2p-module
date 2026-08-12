@@ -8,7 +8,7 @@
     # the mix-RLN spam-protection hook surface (rlnMix* requests + the
     # on_rln_fetch_request event). Local path during bring-up; becomes the
     # fork URL at push time.
-    libp2p.url = "git+file:///Users/arseniy/Waku/Logos/nim-libp2p?ref=feat/mix-rln-cbind";
+    libp2p.url = "git+https://github.com/adklempner/nim-libp2p?ref=feat/mix-rln-cbind";
 
     openmetrics-module = {
       url = "github:logos-co/openmetrics-module";
