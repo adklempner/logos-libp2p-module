@@ -16,6 +16,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 
@@ -50,9 +51,12 @@ inline constexpr int kAwaitSlackMs = 5000;
 // LogosAPI is the cross-module client factory; forward-declared so this
 // codegen-scanned header stays free of Qt/SDK includes (rln.cpp pulls them).
 class LogosAPI;
-// QTimer is forward-declared for the same reason; the in-module proof-refresh
-// timer is created/used only in rln.cpp, which includes the Qt headers.
+// QTimer/QThread/QObject are forward-declared for the same reason; the rln
+// worker machinery is created/used only in rln.cpp, which includes the Qt
+// headers.
 class QTimer;
+class QThread;
+class QObject;
 
 // Result type for internal sync-over-async operations.
 struct SyncResult {
@@ -394,18 +398,30 @@ private:
     // must share it.
     int64_t m_rlnEpochSizeSec = 10;
     // Set once the membership module accepted start() for this scope's
-    // registry; retried by the refresh poller until then. Qt-thread only
-    // (timer + method dispatch share the thread).
-    bool m_rlnModuleStarted = false;
+    // registry; retried by the refresh poller until then.
+    std::atomic<bool> m_rlnModuleStarted{false};
     // Latched true when get_membership_state reports "active" for the scope;
-    // gates rlnIsReady. Qt-thread only.
-    bool m_rlnMembershipActive = false;
-    // Membership poller on the module's Qt thread (where cross-module calls
-    // are safe): retries the membership-module start() until accepted, polls
-    // the scope's membership state until "active", then stops itself.
-    QTimer* m_rlnRefreshTimer = nullptr;
-    void startRlnRefreshTimer();
-    void stopRlnRefreshTimer();
+    // gates rlnIsReady.
+    std::atomic<bool> m_rlnMembershipActive{false};
+    // Latched by the worker once a non-empty roots window was pushed into
+    // the cbind; the worker skips further refresh passes.
+    std::atomic<bool> m_rlnRootsSeeded{false};
+    // ALL cross-module RLN work runs on this dedicated QThread — never on
+    // the module's main Qt thread. Long-blocking stream dispatches (LP
+    // reads, protocol accepts) routinely occupy the main thread for tens of
+    // seconds; anything scheduled there (a drain timer, an
+    // invokeRemoteMethod that marshals to its owner thread) starves for the
+    // duration and the mix hop's 15s proof-fetch window drops the packet.
+    // The worker thread runs its own event loop (the QtRO replica transport
+    // requires one on its owner thread) and lazily constructs the LogosAPI
+    // on itself, so every client's owner thread IS the worker and blocking
+    // waits ride it alone. One thread also serializes start/refresh/drain.
+    QThread* m_rlnThread = nullptr;
+    QObject* m_rlnWorkerObj = nullptr;  // timer host living on m_rlnThread
+    void startRlnWorker();   // main thread (rlnEnable); idempotent
+    void stopRlnWorker();
+    // One refresh pass (start + membership + roots seed). Worker thread.
+    void rlnRefreshTick();
     // One start(config) call at the membership module: epoch base + root-
     // window warm-up for the scope's registry. Sets m_rlnModuleStarted.
     bool rlnStartModule();
@@ -415,11 +431,11 @@ private:
     // an on_rln_fetch_request event. The listener runs on the Nim dispatch
     // (libp2p) thread and enqueues ONLY — any blocking or cross-module (QtRO)
     // call there would stall the chronos loop or deadlock against owner-thread
-    // marshaling. This Qt-thread timer drains the queue, makes the cross-module
-    // reads (safe on the Qt thread), answers each request id via the
-    // rlnMixFetchReply request, and re-pushes fresh roots via the
-    // SetValidRoots request. Concurrent roots requests coalesce into one read,
-    // but every request id gets its own reply.
+    // marshaling. The rln worker (see m_rlnWorker) drains the queue, makes
+    // the blocking reads, answers each request id via the rlnMixFetchReply
+    // request, and re-pushes fresh roots via the SetValidRoots request.
+    // Concurrent roots requests coalesce into one read, but every request id
+    // gets its own reply.
     struct RlnFetchPending {
         uint64_t requestId = 0;
         std::string method;
@@ -427,10 +443,7 @@ private:
     };
     std::mutex m_rlnFetchMutex;
     std::deque<RlnFetchPending> m_rlnFetchQueue;
-    QTimer* m_rlnFetchDrainTimer = nullptr;
     static void onRlnFetchRequest(const RlnFetchRequestEvent* evt, void* ud);
-    void startRlnFetchDrainTimer();
-    void stopRlnFetchDrainTimer();
     void rlnFetchDrain();
     // Fire-and-forget submit of a fetch answer; never blocks on the nim loop.
     void rlnFetchReply(uint64_t requestId, const std::string& error,

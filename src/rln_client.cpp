@@ -1,5 +1,6 @@
 #include "rln_client.h"
 
+#include <QDebug>
 #include <QJsonDocument>
 #include <QString>
 #include <QVariant>
@@ -9,6 +10,7 @@
 
 #include "logos_api.h"
 #include "logos_api_client.h"
+#include "logos_types.h"
 
 namespace {
 using json = nlohmann::json;
@@ -31,9 +33,20 @@ json synthError(const std::string& message) {
 // Non-throwing parse: discarded on failure.
 json tryParse(const std::string& s) { return json::parse(s, nullptr, false); }
 
-// Normalizes a QtRO reply to raw JSON text: a string reply verbatim, a
-// structured (map/list) reply through QJsonDocument.
+// Normalizes a module reply to raw JSON text: the SDK's LogosResult struct
+// (how `result`-dialect replies cross the module wire) re-encoded as its
+// envelope, a string reply verbatim, a structured (map/list) reply through
+// QJsonDocument.
 std::string replyToRawJson(const QVariant& reply) {
+    if (reply.userType() == qMetaTypeId<LogosResult>()) {
+        const LogosResult lr = reply.value<LogosResult>();
+        QVariantMap m;
+        m.insert(QStringLiteral("success"), lr.success);
+        m.insert(QStringLiteral("value"), lr.value);
+        m.insert(QStringLiteral("error"), lr.error);
+        const QJsonDocument doc = QJsonDocument::fromVariant(m);
+        if (!doc.isNull()) return doc.toJson(QJsonDocument::Compact).toStdString();
+    }
     std::string raw = reply.toString().toStdString();
     if (raw.empty() && reply.isValid()) {
         const QJsonDocument doc = QJsonDocument::fromVariant(reply);
@@ -95,9 +108,14 @@ RlnModuleResult unwrapResultEnvelope(const QVariant& reply, const char* method) 
 std::string invokeToString(LogosAPIClient* client, const QString& method,
                            const QVariantList& args, int timeoutMs) {
     if (!client) return {};
-    return client->invokeRemoteMethod(kRlnModule, method, args, Timeout(timeoutMs))
-        .toString()
-        .toStdString();
+    const QVariant reply =
+        client->invokeRemoteMethod(kRlnModule, method, args, Timeout(timeoutMs));
+    if (reply.userType() == qMetaTypeId<LogosResult>()) {
+        // tstr-dialect methods carry the payload (or the in-band {"error":…}
+        // object) as the JSON string in `value`; a failed call has none.
+        return reply.value<LogosResult>().value.toString().toStdString();
+    }
+    return reply.toString().toStdString();
 }
 }  // namespace
 
@@ -111,8 +129,14 @@ RlnModuleResult RlnModuleClient::start(const std::string& configJson) {
         return r;
     }
     const QVariantList args{QString::fromStdString(configJson)};
+    logos::CallError callErr;
     const QVariant reply = m_client->invokeRemoteMethod(
-        kRlnModule, QStringLiteral("start"), args, Timeout(kStartTimeoutMs));
+        kRlnModule, QStringLiteral("start"), args, Timeout(kStartTimeoutMs), &callErr);
+    if (!callErr.ok()) {
+        qWarning() << "rln start transport diagnosis:"
+                   << QString::fromStdString(callErr.code)
+                   << QString::fromStdString(callErr.message).left(300);
+    }
     return unwrapResultEnvelope(reply, "start");
 }
 

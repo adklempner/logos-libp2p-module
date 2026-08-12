@@ -270,14 +270,8 @@ void Libp2pModuleImpl::destroyContext() {
 
 Libp2pModuleImpl::~Libp2pModuleImpl() {
     try {
-        stopRlnRefreshTimer();
-        stopRlnFetchDrainTimer();
+        stopRlnWorker();
         destroyContext();
-        if (m_ownsLogosAPI) {
-            delete m_logosAPI;
-            m_logosAPI = nullptr;
-            m_ownsLogosAPI = false;
-        }
     } catch (...) {}
 }
 
@@ -293,8 +287,7 @@ StdLogosResult Libp2pModuleImpl::start() {
 }
 
 StdLogosResult Libp2pModuleImpl::stop() {
-    stopRlnRefreshTimer();
-    stopRlnFetchDrainTimer();
+    stopRlnWorker();
     auto res = callSync("Failed to stop libp2p", [&](SyncPromise* p) {
         return libp2p_ctx_stop(ctx, &Libp2pModuleImpl::cbBool, p);
     });

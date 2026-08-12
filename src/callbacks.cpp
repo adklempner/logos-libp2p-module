@@ -160,9 +160,18 @@ void Libp2pModuleImpl::onIncomingStream(const IncomingStreamEvent* evt, void* ud
     auto* self = static_cast<Libp2pModuleImpl*>(ud);
     if (!self || !evt) return;
     try {
+        std::string proto = nfStr(evt->proto);
+        // Queue for protocolAcceptStream's blocking wait; the event below is
+        // the push-style delivery of the same stream. Whichever consumer acts
+        // first owns the stream id.
+        {
+            std::lock_guard<std::mutex> lock(self->m_inboundStreamMutex);
+            self->m_inboundStreamQueues[proto].push_back(evt->streamId);
+        }
+        self->m_inboundStreamCond.notify_all();
         json j;
         j["streamId"] = evt->streamId;
-        j["proto"] = nfStr(evt->proto);
+        j["proto"] = proto;
         self->emitEventSafe("protocolStream", j.dump());
     } catch (...) {}
 }

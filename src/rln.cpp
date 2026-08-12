@@ -2,9 +2,12 @@
 
 #include <ctime>
 #include <string>
+#include <thread>
 #include <utility>
 
+#include <QDebug>
 #include <QString>
+#include <QThread>
 #include <QTimer>
 
 #include "logos_api.h"
@@ -12,11 +15,11 @@
 
 using json = nlohmann::json;
 
-// Cross-module RLN calls go over the LogosAPI/QtRO transport (see
-// rln_client.h). A host may inject a handle via initLogos(hex); otherwise the
-// module process lazily constructs its own LogosAPI (registry discovery is
-// process-global). Construction must happen on the Qt thread — rlnEnable
-// warms it up so the drain timer only ever reuses the existing instance.
+// Cross-module RLN calls go over the LogosAPI transport (see rln_client.h).
+// A host may inject a handle via initLogos(hex); otherwise the rln worker
+// thread lazily constructs its own LogosAPI (registry discovery is
+// process-global), making the worker the clients' owner thread so their
+// blocking waits never touch the module's Qt loop.
 LogosAPI* Libp2pModuleImpl::ensureLogosAPI() {
     if (!m_logosAPI) {
         m_logosAPI = new LogosAPI(QStringLiteral("libp2p_module"));
@@ -89,6 +92,8 @@ void Libp2pModuleImpl::onRlnFetchRequest(const RlnFetchRequestEvent* evt, void* 
         req.requestId = evt->requestId;
         req.method = nfStr(evt->methodName);
         req.params = nfStr(evt->paramsJson);
+        qWarning() << "rln fetch: queued" << QString::fromStdString(req.method)
+                   << "req" << static_cast<qulonglong>(req.requestId);
         std::lock_guard<std::mutex> lock(self->m_rlnFetchMutex);
         self->m_rlnFetchQueue.push_back(std::move(req));
     } catch (...) {}
@@ -139,15 +144,12 @@ StdLogosResult Libp2pModuleImpl::rlnEnable(const std::string& configJson) {
     });
     if (!res.success) return res;
 
-    ensureLogosAPI();
-    // Configure the membership module (epoch base + warm the registry's root
-    // window). A failure here (module not up yet) is non-fatal: the refresh
-    // poller retries until start() lands.
-    rlnStartModule();
-    // Every node that verifies proofs needs the drain (not just registered
-    // senders).
-    startRlnFetchDrainTimer();
-    startRlnRefreshTimer();
+    // The membership module's start() (epoch base + root-window warm-up),
+    // the readiness seed and the fetch drain are all the rln worker's job:
+    // a blocking cross-module call on this dispatch's Qt thread would stall
+    // its own loop (see m_rlnWorker in plugin.h). Every node that verifies
+    // proofs needs the worker (not just registered senders).
+    startRlnWorker();
     return {true, {}, ""};
 }
 
@@ -155,29 +157,61 @@ bool Libp2pModuleImpl::rlnStartModule() {
     RlnModuleClient rln(ensureLogosAPI());
     const json cfg{{"epoch_size_sec", m_rlnEpochSizeSec},
                    {"registries", json::array({m_rlnRegistryId})}};
-    m_rlnModuleStarted = rln.start(cfg.dump()).ok;
+    const auto r = rln.start(cfg.dump());
+    if (!r.ok) {
+        qWarning() << "rln start reply not ok:"
+                   << QString::fromStdString(r.error.substr(0, 300));
+    }
+    m_rlnModuleStarted = r.ok;
     return m_rlnModuleStarted;
 }
 
-void Libp2pModuleImpl::startRlnFetchDrainTimer() {
-    if (m_rlnFetchDrainTimer) return;  // already running (re-enable is a no-op)
+void Libp2pModuleImpl::startRlnWorker() {
+    if (m_rlnThread) return;  // already running (re-enable is a no-op)
 
     // 200ms keeps worst-case event-to-answer latency well inside nim's 3s
-    // awaitRootRefresh window while staying idle-cheap (empty-queue check only).
-    m_rlnFetchDrainTimer = new QTimer();
-    m_rlnFetchDrainTimer->setInterval(200);
-    // Same 3-arg connect pattern as startRlnRefreshTimer: lambda runs on the
-    // timer's (Qt/module) thread where cross-module calls are safe.
-    QObject::connect(m_rlnFetchDrainTimer, &QTimer::timeout, m_rlnFetchDrainTimer,
-                     [this]() { rlnFetchDrain(); });
-    m_rlnFetchDrainTimer->start();
+    // awaitRootRefresh window while staying idle-cheap (empty-queue check
+    // only). The refresh pass repeats every 25 ticks (5s) until the roots
+    // window seeded. A long call inside a tick simply delays the next tick —
+    // the timer coalesces.
+    m_rlnThread = new QThread();
+    m_rlnThread->setObjectName(QStringLiteral("rln-worker"));
+    m_rlnWorkerObj = new QObject();
+    auto* timer = new QTimer(m_rlnWorkerObj);
+    timer->setInterval(200);
+    auto passes = std::make_shared<int>(INT_MAX - 1);  // first refresh immediate
+    QObject::connect(timer, &QTimer::timeout, timer, [this, passes]() {
+        rlnFetchDrain();
+        if (!m_rlnRootsSeeded.load() && ++(*passes) >= 25) {
+            *passes = 0;
+            rlnRefreshTick();
+        }
+    });
+    // start() must run on the timer's own thread.
+    QObject::connect(m_rlnThread, &QThread::started, timer,
+                     qOverload<>(&QTimer::start));
+    m_rlnWorkerObj->moveToThread(m_rlnThread);  // timer (child) moves along
+    m_rlnThread->start();
 }
 
-void Libp2pModuleImpl::stopRlnFetchDrainTimer() {
-    if (!m_rlnFetchDrainTimer) return;
-    m_rlnFetchDrainTimer->stop();
-    m_rlnFetchDrainTimer->deleteLater();
-    m_rlnFetchDrainTimer = nullptr;
+void Libp2pModuleImpl::stopRlnWorker() {
+    if (!m_rlnThread) return;
+    m_rlnThread->quit();
+    m_rlnThread->wait();
+    delete m_rlnWorkerObj;
+    m_rlnWorkerObj = nullptr;
+    delete m_rlnThread;
+    m_rlnThread = nullptr;
+    // The worker owned the LogosAPI's thread affinity; drop the instance so
+    // a later start builds a fresh one on the new worker instead of
+    // marshaling onto a dead thread.
+    if (m_ownsLogosAPI) {
+        delete m_logosAPI;
+        m_logosAPI = nullptr;
+        m_ownsLogosAPI = false;
+    }
+    m_rlnRootsSeeded.store(false);
+    m_rlnModuleStarted.store(false);
 }
 
 void Libp2pModuleImpl::rlnFetchReply(uint64_t requestId, const std::string& error,
@@ -190,7 +224,11 @@ void Libp2pModuleImpl::rlnFetchReply(uint64_t requestId, const std::string& erro
     // Fire-and-forget: the request is encoded synchronously before submit and
     // the null reply callback frees the call box, so nothing here may block on
     // the nim loop.
-    libp2p_ctx_rln_mix_fetch_reply(ctx, &req, nullptr, nullptr);
+    const int rc = libp2p_ctx_rln_mix_fetch_reply(ctx, &req, nullptr, nullptr);
+    if (rc != NIMFFI_RET_OK) {
+        qWarning() << "rln fetch reply submit failed rc=" << rc << "req"
+                   << static_cast<qulonglong>(requestId);
+    }
 }
 
 void Libp2pModuleImpl::rlnFetchDrain() {
@@ -201,12 +239,14 @@ void Libp2pModuleImpl::rlnFetchDrain() {
     }
     if (pending.empty()) return;
 
+    // Worker thread: the lazily-built LogosAPI is owned by this thread (the
+    // worker is its only constructor once the QML bridge hasn't injected one).
     RlnModuleClient rln(ensureLogosAPI());
 
     // One get_valid_roots read serves every queued roots request in this pass
     // plus the proactive SetValidRoots push below.
     std::string rootsReply;  // fetch-contract payload: roots object or {"error":…}
-    std::string rootsJson;   // the module's {"valid_roots":[…]} when the read succeeded
+    std::string rootsArr;    // the bare roots array (the SetValidRoots shape)
     bool readRoots = false;
     auto fetchRoots = [&]() -> const std::string& {
         if (!readRoots) {
@@ -220,13 +260,16 @@ void Libp2pModuleImpl::rlnFetchDrain() {
                 // both already the fetch-contract shape, pass through verbatim.
                 rootsReply = raw;
                 const json j = json::parse(raw, nullptr, false);
-                if (j.is_object() && j.contains("valid_roots")) rootsJson = raw;
+                if (j.is_object() && j["valid_roots"].is_array()) {
+                    rootsArr = j["valid_roots"].dump();
+                }
             }
         }
         return rootsReply;
     };
 
     for (const auto& req : pending) {
+        const auto t0 = std::chrono::steady_clock::now();
         std::string payload;
         if (req.method == "get_valid_roots") {
             payload = fetchRoots();
@@ -237,14 +280,21 @@ void Libp2pModuleImpl::rlnFetchDrain() {
             payload = fetchError("permanent", "invalid_argument",
                                  "unknown rln fetch method '" + req.method + "'");
         }
+        const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                            std::chrono::steady_clock::now() - t0)
+                            .count();
+        qWarning() << "rln drain: served" << QString::fromStdString(req.method)
+                   << "req" << static_cast<qulonglong>(req.requestId) << "in" << ms
+                   << "ms:" << QString::fromStdString(payload.substr(0, 120));
         rlnFetchReply(req.requestId, "", payload);
     }
 
     // Keep the verifier's window fresh off the same read. A failed read is
-    // dropped here: nim re-requests after its throttle interval.
-    if (!rootsJson.empty()) {
+    // dropped here: nim re-requests after its throttle interval. The cbind
+    // takes the bare array, not the {"valid_roots":[…]} wrapper.
+    if (!rootsArr.empty()) {
         callSync("Failed to set valid roots", [&](SyncPromise* p) {
-            return libp2p_ctx_rln_mix_set_valid_roots(ctx, nimffi_str(rootsJson.c_str()),
+            return libp2p_ctx_rln_mix_set_valid_roots(ctx, nimffi_str(rootsArr.c_str()),
                                                       &Libp2pModuleImpl::cbBool, p);
         });
     }
@@ -271,36 +321,52 @@ StdLogosResult Libp2pModuleImpl::rlnRegister(const std::string& argsJson) {
             "consumes proofs and roots for that scope"};
 }
 
-void Libp2pModuleImpl::startRlnRefreshTimer() {
-    if (m_rlnRefreshTimer) return;  // already running (re-enable is a no-op)
-
-    // Poll until the membership module accepted start() AND the scope's
-    // membership reads "active", then stop — everything afterwards is
-    // request-driven through the fetch drain.
-    m_rlnRefreshTimer = new QTimer();
-    m_rlnRefreshTimer->setInterval(5000);
-    // 3-arg connect with the timer as context: the lambda runs on the timer's
-    // (Qt/module) thread, where cross-module calls are safe, and the
-    // connection drops automatically when the timer is destroyed.
-    QObject::connect(m_rlnRefreshTimer, &QTimer::timeout, m_rlnRefreshTimer, [this]() {
-        if (!m_rlnModuleStarted && !rlnStartModule()) return;  // module not up yet
-        RlnModuleClient rln(ensureLogosAPI());
+// Worker-thread body: blocking cross-module reads are safe here — the Qt
+// loop stays free, and the clients' owner thread is this worker.
+void Libp2pModuleImpl::rlnRefreshTick() {
+    if (!m_rlnModuleStarted.load() && !rlnStartModule()) {
+        qWarning() << "rln refresh: membership module start not accepted yet";
+        return;  // module not up yet
+    }
+    RlnModuleClient rln(ensureLogosAPI());
+    if (!m_rlnMembershipActive.load()) {
         const std::string reply =
             rln.getMembershipState(m_rlnRegistryId, m_rlnIdentifierHex);
         const json j = json::parse(reply, nullptr, false);
-        if (j.is_object() && j.value("state", std::string()) == "active") {
-            m_rlnMembershipActive = true;
-            stopRlnRefreshTimer();
+        if (!(j.is_object() && j.value("state", std::string()) == "active")) {
+            qWarning() << "rln refresh: membership not active:"
+                       << QString::fromStdString(reply.substr(0, 200));
+            return;
         }
+        m_rlnMembershipActive.store(true);
+    }
+    // Seed the cbind's valid-roots window: nim refreshes it only on a
+    // verify miss, so a node that has not yet received a packet has an
+    // empty window and reports not-ready. Retried until the module's own
+    // window (start()'s async warm-up) serves a NON-EMPTY roots array —
+    // pushing [] would satisfy the nim call yet leave the verifier
+    // not-ready with nothing left to refresh it.
+    const std::string raw = rln.getValidRoots(m_rlnRegistryId);
+    const json r = json::parse(raw, nullptr, false);
+    if (!(r.is_object() && r["valid_roots"].is_array() &&
+          !r["valid_roots"].empty())) {
+        qWarning() << "rln refresh: no usable valid_roots yet:"
+                   << QString::fromStdString(raw.substr(0, 200));
+        return;
+    }
+    // The cbind takes the bare array (newest first), not the module's
+    // {"valid_roots":[…]} wrapper.
+    const std::string rootsArr = r["valid_roots"].dump();
+    auto pushed = callSync("Failed to set valid roots", [&](SyncPromise* p) {
+        return libp2p_ctx_rln_mix_set_valid_roots(ctx, nimffi_str(rootsArr.c_str()),
+                                                  &Libp2pModuleImpl::cbBool, p);
     });
-    m_rlnRefreshTimer->start();
-}
-
-void Libp2pModuleImpl::stopRlnRefreshTimer() {
-    if (!m_rlnRefreshTimer) return;
-    m_rlnRefreshTimer->stop();
-    m_rlnRefreshTimer->deleteLater();
-    m_rlnRefreshTimer = nullptr;
+    if (!pushed.success) {
+        qWarning() << "rln refresh: set_valid_roots push failed:"
+                   << QString::fromStdString(pushed.error.substr(0, 200));
+        return;
+    }
+    m_rlnRootsSeeded.store(true);
 }
 
 StdLogosResult Libp2pModuleImpl::rlnRefreshProof() {
